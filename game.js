@@ -31,18 +31,28 @@ renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
-// When installed as a Quest app, the flat page isn't shown at all: go straight into VR on launch
-// (and again whenever the headset hands the app a session).
-async function autoEnterVR() {
-  if (!navigator.xr || renderer.xr.isPresenting) return;
+// When installed as a Quest app, the flat page isn't shown at all: go straight into VR on launch.
+// The headset's VR system can take a moment to be ready, so keep trying every second until it works.
+window.__xrlog = [];
+const xrlog = (m) => { window.__xrlog.push(((performance.now() / 1000) | 0) + 's ' + m); };
+let autoTries = 0, autoBusy = false;
+async function autoEnterVR(reason = '') {
+  if (!navigator.xr || renderer.xr.isPresenting || autoBusy) return;
+  autoBusy = true; autoTries++;
   try {
-    if (!(await navigator.xr.isSessionSupported('immersive-vr'))) return;
+    const ok = await navigator.xr.isSessionSupported('immersive-vr');
+    if (!ok) { xrlog(`try ${autoTries} ${reason}: not supported yet`); return; }
     const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
-    await renderer.xr.setSession(session);
-  } catch (e) { console.warn('auto-enter VR failed:', e); }
+    await renderer.xr.setSession(session); xrlog(`try ${autoTries} ${reason}: VR started`);
+  } catch (e) { xrlog(`try ${autoTries} ${reason}: ${e.name} ${e.message}`); }
+  finally { autoBusy = false; }
 }
-if (navigator.xr) navigator.xr.addEventListener('sessiongranted', autoEnterVR);
-if (matchMedia('(display-mode: standalone)').matches) autoEnterVR();
+if (navigator.xr) navigator.xr.addEventListener('sessiongranted', () => autoEnterVR('granted'));
+if (matchMedia('(display-mode: standalone)').matches) {
+  autoEnterVR('load');
+  const retry = setInterval(() => { if (renderer.xr.isPresenting || autoTries > 30) clearInterval(retry); else autoEnterVR('retry'); }, 1000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') autoEnterVR('visible'); });
+}
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#8fd0ff');
