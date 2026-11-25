@@ -1,5 +1,5 @@
 // Offline cache: the game keeps working with no internet once it has loaded once.
-const CACHE = 'canopy-v1';
+const CACHE = 'canopy-v2';
 const FILES = ['./', './index.html', './game.js', './monster.js', './gore.js', './talk.js', './manifest.webmanifest',
   './lib/three.module.js', './lib/VRButton.js', './lib/addons/loaders/GLTFLoader.js', './lib/addons/utils/BufferGeometryUtils.js',
   './lib/addons/objects/Reflector.js', './models/ape.glb', './icons/icon-192.png', './icons/icon-512.png'];

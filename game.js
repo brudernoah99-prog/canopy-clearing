@@ -31,6 +31,18 @@ renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
+// When installed as a Quest app, the flat page isn't shown at all: go straight into VR on launch
+// (and again whenever the headset hands the app a session).
+async function autoEnterVR() {
+  if (!navigator.xr || renderer.xr.isPresenting) return;
+  try {
+    if (!(await navigator.xr.isSessionSupported('immersive-vr'))) return;
+    const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
+    await renderer.xr.setSession(session);
+  } catch (e) { console.warn('auto-enter VR failed:', e); }
+}
+if (navigator.xr) navigator.xr.addEventListener('sessiongranted', autoEnterVR);
+if (matchMedia('(display-mode: standalone)').matches) autoEnterVR();
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#8fd0ff');
