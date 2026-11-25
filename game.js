@@ -174,12 +174,14 @@ function step(dt) {
     if (h.stuck) {
       const c = contact(tracked, T.handRadius);
       const tooFar = h.stuck.distanceTo(head) > T.maxArmReach;
-      if (c.dist > T.handRadius + T.releaseSlack || tooFar) h.stuck = null;          // lifted off: let go
+      const away = tracked.clone().sub(h.stuck).dot(h.normal);                       // how far the real hand moved off the surface
+      if (away > 0.004 || c.dist > T.handRadius + T.releaseSlack || tooFar) h.stuck = null;   // lifting off lets go right away
       else { move.add(h.stuck.clone().sub(tracked)); n++; }                         // still pressing: hand stays put, body moves
     } else {
       const c = contact(tracked, T.handRadius);
       if (c.dist < T.handRadius + T.touchSlack) {                                   // touched something: grab that spot
         h.stuck = c.dist < T.handRadius ? c.rest : tracked.clone();
+        h.normal = c.normal.clone();
         move.add(h.stuck.clone().sub(tracked)); n++;
         pulse(h, 0.25, 30);
       }
