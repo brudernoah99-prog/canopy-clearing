@@ -73,17 +73,8 @@ export async function initGore(scene, addSplat, contact = null) {
       const b = mk(cylGeo, bone, g); b.scale.set(0.022, 0.075, 0.022); alongY(b, dir); b.position.copy(dir).multiplyScalar(0.035);
       const k = mk(knobGeo, bone, g); k.scale.setScalar(0.032); k.position.copy(dir).multiplyScalar(0.075);
       for (let i = 0; i < 3; i++) { const s = mk(chunkGeo, meat, g); s.scale.setScalar(0.014 + Math.random() * 0.01); s.position.copy(dir).multiplyScalar(0.02 + Math.random() * 0.03).add(V((Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06)); }
-    } else if (j.kind === 'spine') {   // the spine comes out with the head: a curving chain of vertebrae, red between them
-      let p = dir.clone().multiplyScalar(0.012); let d = dir.clone(); const back = V(0, 0, -1);
-      const n = 8;
-      for (let i = 0; i < n; i++) {
-        const v = mk(vertGeo, bone, g); alongY(v, d); v.position.copy(p); v.scale.setScalar(1 - i * 0.045);
-        const pr = mk(procGeo, bone, g); pr.position.copy(p).addScaledVector(back, 0.03); alongY(pr, d); pr.scale.setScalar(1 - i * 0.045);
-        if (i < n - 1) { const dsc = mk(discGeo, i % 2 ? meat : meatLight, g); alongY(dsc, d); dsc.position.copy(p).addScaledVector(d, 0.022); }
-        p = p.clone().addScaledVector(d, 0.042);
-        d = d.clone().addScaledVector(back, 0.07).add(V((Math.random() - 0.5) * 0.08, 0, (Math.random() - 0.5) * 0.04)).normalize();
-      }
-      const tip = mk(chunkGeo, meat, g); tip.scale.setScalar(0.03); tip.position.copy(p);
+    } else if (j.kind === 'spine') {   // the spine itself is a separate long chain (makeRope); here: where it starts + stringy bits
+      piece.userData.spineTop = at.clone().addScaledVector(dir, 0.01); piece.userData.spineDir = dir.clone();
       // stringy bits hanging off the top of the spine
       for (let i = 0; i < 3; i++) { const a = Math.random() * 6.28; const s = V(Math.cos(a) * 0.04, 0, Math.sin(a) * 0.04);
         tube([s, s.clone().addScaledVector(dir, 0.06).add(V(0, 0, 0.01)), s.clone().addScaledVector(dir, 0.11 + Math.random() * 0.06).add(V((Math.random() - 0.5) * 0.05, 0, (Math.random() - 0.5) * 0.05))], 0.006 + Math.random() * 0.004, i ? meat : meatLight, g); }
@@ -100,6 +91,76 @@ export async function initGore(scene, addSplat, contact = null) {
   const makeAvatar = () => { const a = gltf.scene.clone(true); a.userData.parts = partsOf(a); a.userData.bleeds = []; scene.add(a); return a; };
   // a single torn-off part (used for your own arm), with its wound, in model space
   function makeLimb(name) { const o = gltf.scene.getObjectByName(name).clone(true); decorate(o, name, G.level === 'full'); return { o, ...jointInfo(o, name) }; }
+
+  // ---------- the spine: a long chain of vertebrae hanging from a torn-off head ----------
+  // attached: its lower end is still inside the body; pulling the head away slides it out, until all of it is out and it pops free.
+  // free: a wobbly chain (verlet) swinging from the head.
+  const SEG = 0.05, NV = 16;                     // 16 vertebrae, 0.8 m
+  const ropes = [];
+  function makeRope(piece, anchor = null) {
+    const top = piece.userData.spineTop; if (!top) return null;
+    const grp = new THREE.Group(); scene.add(grp);
+    const R = { piece, anchor, grp, verts: [], procs: [], discs: [], p: [], prev: [], attached: !!anchor, tension: 0, popped: false, t: 0, dead: false };
+    for (let i = 0; i < NV; i++) {
+      const sc = 1 - i * 0.022;
+      const v = mk(vertGeo, bone, grp); v.scale.set(sc, 1.25, sc); R.verts.push(v);
+      const pr = mk(procGeo, bone, grp); pr.scale.setScalar(sc); R.procs.push(pr);
+      const d = mk(discGeo, i % 2 ? meat : meatLight, grp); d.scale.setScalar(sc); R.discs.push(d);
+    }
+    const tip = mk(chunkGeo, meat, grp); tip.scale.setScalar(0.028); R.tip = tip;
+    piece.updateMatrixWorld(true); const t0 = piece.localToWorld(top.clone()); const d0 = piece.userData.spineDir.clone().applyQuaternion(piece.getWorldQuaternion(new THREE.Quaternion()));
+    for (let i = 0; i <= NV; i++) { const q = t0.clone().addScaledVector(d0, i * SEG * (anchor ? 0.05 : 1)); R.p.push(q); R.prev.push(q.clone()); }
+    ropes.push(R); while (ropes.length > 6) { const o = ropes.shift(); scene.remove(o.grp); }
+    return R;
+  }
+  const _a = V(), _b = V(), _dir = V(), _side = V(), UP = V(0, 1, 0);
+  function updateRope(R, dt) {
+    if (!R.piece.parent) { scene.remove(R.grp); R.dead = true; return; }
+    R.t += dt; R.piece.updateMatrixWorld(true);
+    const top = R.piece.localToWorld(R.piece.userData.spineTop.clone());
+    const dirW = R.piece.userData.spineDir.clone().applyQuaternion(R.piece.getWorldQuaternion(_qq));
+    let visible = NV;
+    if (R.attached) {
+      if (!R.anchor.obj.parent) R.attached = false;
+      else {
+        const A = R.anchor.obj.localToWorld(R.anchor.local.clone()); const D = top.distanceTo(A), total = NV * SEG;
+        R.tension = Math.min(1, D / total);
+        if (D > total + 0.03) {   // all of it is out: it pops free
+          R.attached = false; R.popped = true; spurt(A, V(0, 1, 0), 30, 2.6); spurt(R.p[NV], V(0, -1, 0), 12, 1.2); sfx('crunch', 1); sfx('tear', 0.8);
+          for (let i = 0; i <= NV; i++) R.prev[i].copy(R.p[i]);
+        } else {
+          // what's out so far runs from the head down into the neck hole, sagging a little; the rest is still inside
+          visible = Math.min(NV, Math.ceil(D / SEG));
+          const ctrl = top.clone().lerp(A, 0.5).add(V(0, -0.12 * (1 - R.tension), 0)).addScaledVector(dirW, 0.08 * (1 - R.tension));
+          for (let i = 0; i <= NV; i++) { const u = Math.min(1, (i * SEG) / Math.max(D, 1e-3));
+            const q = top.clone().multiplyScalar((1 - u) * (1 - u)).addScaledVector(ctrl, 2 * u * (1 - u)).addScaledVector(A, u * u);
+            q.x += Math.sin(R.t * 30 + i) * 0.004 * R.tension; R.p[i].copy(q); R.prev[i].copy(q); }
+        }
+      }
+    }
+    if (!R.attached) {   // verlet chain, pinned at the head
+      R.p[0].copy(top); R.prev[0].copy(top);
+      for (let i = 1; i <= NV; i++) { const p = R.p[i], q = R.prev[i]; _a.copy(p).sub(q).multiplyScalar(0.985); q.copy(p); p.add(_a); p.y -= 9.8 * dt * dt; }
+      for (let it = 0; it < 10; it++) {
+        R.p[1].copy(top).addScaledVector(dirW, SEG).lerp(R.p[1], 0.75);       // the first joint leaves the head along the neck
+        for (let i = 0; i < NV; i++) { const a = R.p[i], b = R.p[i + 1]; _dir.copy(b).sub(a); const L = _dir.length() || 1e-6; const k = (L - SEG) / L;
+          if (i === 0) b.addScaledVector(_dir, -k); else { a.addScaledVector(_dir, k * 0.5); b.addScaledVector(_dir, -k * 0.5); } }
+        R.p[0].copy(top);
+      }
+      for (let i = 1; i <= NV; i++) { const p = R.p[i]; if (contact) { const c = contact(p, 0.025); if (c.dist < 0.025) p.copy(c.rest); } else if (p.y < 0.025) p.y = 0.025; }
+      if (R.t < 8 && Math.random() < 0.08) spurt(R.p[NV], V(0, -1, 0), 1, 0.3);   // drips off the end
+    }
+    // place the vertebrae along the chain
+    for (let i = 0; i < NV; i++) {
+      const a = R.p[i], b = R.p[i + 1]; _dir.copy(b).sub(a); const L = _dir.length(); const show = i < visible && L > 1e-4;
+      R.verts[i].visible = R.procs[i].visible = R.discs[i].visible = show; if (!show) continue; _dir.divideScalar(L);
+      _side.copy(_dir).cross(UP); if (_side.lengthSq() < 1e-4) _side.set(1, 0, 0); _side.normalize(); const back = _a.copy(_side).cross(_dir).normalize();
+      const v = R.verts[i]; v.position.copy(a).lerp(b, 0.45); v.quaternion.setFromUnitVectors(UP, _dir);
+      const pr = R.procs[i]; pr.position.copy(v.position).addScaledVector(back, 0.032); pr.quaternion.copy(v.quaternion);
+      const d = R.discs[i]; d.position.copy(b); d.quaternion.copy(v.quaternion);
+    }
+    R.tip.visible = visible >= NV; R.tip.position.copy(R.p[NV]);
+  }
 
   // ---------- sound (synthesized, no files) ----------
   let ac = null, noiseBuf = null;
@@ -182,10 +243,12 @@ export async function initGore(scene, addSplat, contact = null) {
     const full = G.level === 'full'; avatar.updateMatrixWorld(true); scene.attach(o); delete P[name];
     decorate(o, name, full);
     if (P.Body) { decorate(P.Body, 'Body', full, name); const j = JOINTS.Body.find(j => j.for === name); const c = V().fromArray(P.Body.userData.c); avatar.userData.bleeds.push({ body: P.Body, jointLocal: j.at.clone().sub(c), dirLocal: j.dir.clone(), t: 0 }); bleedingAvatars.add(avatar); }
+    let rope = null;
+    if (name === 'Head' && full && P.Body) { const cb = V().fromArray(P.Body.userData.c); rope = makeRope(o, { obj: P.Body, local: NECK.clone().sub(cb).add(V(0, -0.02, -0.03)) }); }
     const info = jointInfo(o, name); const wp = o.localToWorld(info.jointLocal.clone());
     spurt(wp, info.dirLocal.clone().applyQuaternion(o.quaternion).negate().add(V(0, 0.5, 0)), 30, 2.6);
     sfx(name === 'Head' ? 'crunch' : 'tear'); sfx('tear', 0.6);
-    return { o, ...info };
+    return { o, ...info, rope };
   }
   const bleedingAvatars = new Set();
 
@@ -195,6 +258,7 @@ export async function initGore(scene, addSplat, contact = null) {
     const r = () => Math.random() - 0.5;
     for (const name of ['Head', 'Arm_L', 'Arm_R']) if (P[name]) decorate(P[name], name, full);
     if (P.Body) for (const j of JOINTS.Body) if (P[j.for]) woundAt(P.Body, j, full);
+    if (P.Head && full) makeRope(P.Head, null);
     if (P.Head) loosen(P.Head, push.clone().multiplyScalar(1.5).add(V(r(), 5.2, r())), V(r() * 12, r() * 8, r() * 12), 1.6, jointInfo(P.Head, 'Head'), RADIUS.Head);
     if (P.Arm_L) loosen(P.Arm_L, side.clone().multiplyScalar(3.2).add(V(r(), 2.8, r())), V(r() * 14, r() * 10, r() * 14), 1.3, jointInfo(P.Arm_L, 'Arm_L'), RADIUS.Arm_L);
     if (P.Arm_R) loosen(P.Arm_R, side.clone().multiplyScalar(-3.2).add(V(r(), 2.8, r())), V(r() * 14, r() * 10, r() * 14), 1.3, jointInfo(P.Arm_R, 'Arm_R'), RADIUS.Arm_R);
@@ -217,6 +281,7 @@ export async function initGore(scene, addSplat, contact = null) {
   const pulseAt = (t) => Math.pow(Math.max(0, Math.sin(t * Math.PI * 2 * 1.5)), 3);   // heartbeat-like spurts, 1.5 per second
   function update(dt) {
     updateDrops(dt);
+    for (const r of ropes) if (!r.dead) updateRope(r, dt);
     for (const p of pieces) {
       const o = p.o; p.t += dt;
       p.vel.y -= 9.8 * dt; o.position.addScaledVector(p.vel, dt);

@@ -343,7 +343,7 @@ function ripArm(s, by) {
   addLimb(r, by);
 }
 function addLimb(r, by) {
-  const L = { o: r.o, vel: V(), spin: V(), heldBy: null, offset: null, t: 0, jointLocal: r.jointLocal, dirLocal: r.dirLocal }; limbs.push(L);
+  const L = { o: r.o, vel: V(), spin: V(), heldBy: null, offset: null, t: 0, jointLocal: r.jointLocal, dirLocal: r.dirLocal, rope: r.rope || null }; limbs.push(L);
   if (limbs.length > 8) { const old = limbs.shift(); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); }
   if (by) hold(L, by);
   return L;
@@ -388,11 +388,11 @@ function pullDummy(h, p) {
       const op = mode === 'monster' ? beastHandPos(sideOf(other)) : other.mesh.position; const sep = p.distanceTo(op);
       if (G.sep0 === undefined) G.sep0 = sep; const k = clamp((sep - G.sep0) / 0.28, 0, 1);
       if (k > 0.05) { pulse(h, 0.2 + 0.8 * k, 20); pulse(other, 0.2 + 0.8 * k, 20); }
-      d.a.scale.set(1 + 0.12 * k, 1, 1);   // it stretches before it gives
-      if (sep - G.sep0 > 0.28) { d.a.scale.setScalar(1); const push = p.clone().sub(op).setY(0); h.ripGrab = null; other.ripGrab = null; smashDummy(d, V(push.z, 0, -push.x), true); hands.forEach(x => pulse(x, 1, 300)); }
+      d.a.scale.set((1 + 0.12 * k) * DUMMY_SCALE, DUMMY_SCALE, DUMMY_SCALE);   // it stretches before it gives
+      if (sep - G.sep0 > 0.28) { d.a.scale.setScalar(DUMMY_SCALE); const push = p.clone().sub(op).setY(0); h.ripGrab = null; other.ripGrab = null; smashDummy(d, V(push.z, 0, -push.x), true); hands.forEach(x => pulse(x, 1, 300)); }
       return;
     }
-    G.sep0 = undefined; d.a.scale.setScalar(1);
+    G.sep0 = undefined; if (d.grow >= 1) d.a.scale.setScalar(DUMMY_SCALE);
     const k = clamp(pull / 0.5, 0, 1); if (k > 0.05) pulse(h, 0.15 + 0.6 * k, 20);
     d.w && (d.w.x += (p.z - restW.z) * 0.02, d.w.z += -(p.x - restW.x) * 0.02);
     if (pull > 0.5) { h.ripGrab = null; smashDummy(d, p.clone().sub(restW), false); }   // yanked hard enough: it comes apart
@@ -445,6 +445,8 @@ function updateLimbs(dt) {
       const c = contact(o.position, 0.11);
       if (c.dist < 0.11) { o.position.copy(c.rest); const vn = L.vel.dot(c.normal); if (vn < 0) { if (vn < -2) addSplat(c.point, c.normal, 0.35 + Math.random() * 0.3); L.vel.addScaledVector(c.normal, -1.3 * vn); } L.vel.multiplyScalar(0.72); L.spin.multiplyScalar(0.6); }
     }
+    // a spine still inside the body: the controller buzzes harder the further it's pulled out, then a jolt when it pops free
+    if (L.rope) { if (L.rope.attached && L.heldBy) pulse(L.heldBy, 0.1 + 0.6 * L.rope.tension, 20); if (L.rope.popped) { L.rope.popped = false; if (L.heldBy) pulse(L.heldBy, 1, 200); } }
     // the torn end spurts in pulses, then drips
     if (L.jointLocal && L.t < 7) { const w = o.localToWorld(L.jointLocal.clone()); const d = L.dirLocal.clone().applyQuaternion(o.quaternion);
       const k = Math.pow(Math.max(0, Math.sin(L.t * Math.PI * 3)), 3) * Math.max(0.15, 1 - L.t / 6);
@@ -479,24 +481,25 @@ function updatePod(dt, t, headPos) {
 }
 
 // ---------------- test dummies ----------------
+const DUMMY_SCALE = 0.85;   // the same size as your gorilla when you're on the floor
 const dummies = DUMMY_SPOTS.map(at => ({ at, a: null, grow: 1, respawn: 0 }));
 function spawnDummy(d) { d.a = gore.makeAvatar(); d.a.position.copy(d.at); d.a.scale.setScalar(0.01); d.grow = 0; }
 dummies.forEach(spawnDummy);
 function smashDummy(d, push, split = false) {
-  if (!d.a) return; d.a.scale.setScalar(1); d.a.updateMatrixWorld(true);
+  if (!d.a) return; d.a.scale.setScalar(DUMMY_SCALE); d.a.updateMatrixWorld(true);
   gore.dismember(d.a, push.clone().setY(0).normalize(), { split }); d.a = null; d.respawn = 4.5; d.tornT = undefined;
 }
 function updateDummies(dt, t, hitters) {
   dummies.forEach((d, i) => {
     if (!d.a) { d.respawn -= dt; if (d.respawn <= 0) spawnDummy(d); return; }
-    if (d.grow < 1) { d.grow = Math.min(1, d.grow + dt / 0.9); d.a.scale.setScalar(Math.max(0.01, easeOutBack(d.grow, 1.6))); }
+    if (d.grow < 1) { d.grow = Math.min(1, d.grow + dt / 0.9); d.a.scale.setScalar(Math.max(0.01, easeOutBack(d.grow, 1.6)) * DUMMY_SCALE); }
     if (d.tornT !== undefined) { d.tornT += dt; if (d.tornT > 25) { smashDummy(d, V(0, 0, 1)); return; } }   // a torn-up dummy falls apart after a while
     // wobble: a springy tilt that punches push on
     const w = d.w || (d.w = { x: 0, z: 0, vx: 0, vz: 0, cd: 0 }); w.cd -= dt;
     w.vx += (-w.x * 70 - w.vx * 5) * dt; w.vz += (-w.z * 70 - w.vz * 5) * dt; w.x = clamp(w.x + w.vx * dt, -0.5, 0.5); w.z = clamp(w.z + w.vz * dt, -0.5, 0.5);
     d.a.rotation.set(w.x, Math.sin(t * 0.8 + i) * 0.06, w.z);
     const grabbed = hands.some(h => h.ripGrab && h.ripGrab.dummy === d);
-    const c = d.at.clone().add(V(0, 0.75, 0));
+    const c = d.at.clone().add(V(0, 0.75 * DUMMY_SCALE, 0));
     if (w.cd <= 0 && !grabbed) for (const hit of hitters) {
       const dx = hit.pos.x - c.x, dz = hit.pos.z - c.z, dy = hit.pos.y - c.y; const sp = hit.vel.length();
       if (Math.hypot(dx, dz) < hit.r && Math.abs(dy) < 0.7 && sp > hit.speed) {
@@ -637,13 +640,13 @@ function desktopView(t, dt, talk) {
     for (const h of [hl, hr]) if (!h.gamepad) h.gamepad = { buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })), hapticActuators: [] };
     const d3 = dummies[2].at, d4 = dummies[3].at, d2 = dummies[1].at; const sm = (a, b, x) => sstep(a, b, x);
     let pl = V(-1.2, 1.2, -4.0), pr = V(1.2, 1.2, -4.0), gl = 0, gr = 0;
-    if (t > 2 && t < 5) { const head = V(d3.x, 1.54, d3.z + 0.12); pr = head.clone().lerp(head.clone().add(V(0.1, 0.2, 0.6)), sm(3.0, 4.0, t)); gr = t > 2.5 ? 1 : 0; }
-    if (t > 5.5 && t < 8.5) { const body = V(d4.x, 0.95, d4.z + 0.15); const k = sm(6.5, 7.7, t); pl = body.clone().add(V(-0.15 - 0.3 * k, 0, 0.05)); pr = body.clone().add(V(0.15 + 0.3 * k, 0, 0.05)); gl = gr = t > 6 ? 1 : 0; }
-    if (t > 9 && t < 11) { pr = V(d2.x + 0.6 - 1.2 * sm(9.5, 9.7, t), 1.0, d2.z + 0.1); }
+    if (t > 2 && t < 9) { const head = V(d3.x, 1.36, d3.z + 0.1); pr = head.clone().lerp(head.clone().add(V(0.25, 0.25, 1.1)), sm(3.0, 6.0, t)); if (t > 6.5) pr.add(V(0.25 * Math.sin((t - 6.5) * 9), 0, 0)); gr = t > 2.5 ? 1 : 0; }
+    if (t > 9.5 && t < 12.5) { const body = V(d4.x, 0.8, d4.z + 0.13); const k = sm(10.5, 11.7, t); pl = body.clone().add(V(-0.15 - 0.3 * k, 0, 0.05)); pr = body.clone().add(V(0.15 + 0.3 * k, 0, 0.05)); gl = gr = t > 10 ? 1 : 0; }
+    if (t > 13 && t < 15) { pr = V(d2.x + 0.6 - 1.2 * sm(13.5, 13.7, t), 0.85, d2.z + 0.1); }
     for (const [h, p, g] of [[hl, pl, gl], [hr, pr, gr]]) { const prev = h.mesh.position.clone(); h.mesh.position.copy(p); h.vel.copy(p).sub(prev).divideScalar(Math.max(dt, 1e-3)); h.gamepad.buttons[1].value = g; }
     updateRipping(dt);
     const inputs = { L: { pos: hl.mesh.position, vel: hl.vel, h: hl }, R: { pos: hr.mesh.position, vel: hr.vel, h: hr } };
-    camera.position.set(2.2, 1.7, -2.2); camera.lookAt(1.6, 0.9, -6);
+    if (new URLSearchParams(location.search).get('cam') === 'side') { camera.position.set(d3.x + 1.9, 1.35, d3.z + 0.7); camera.lookAt(d3.x, 1.0, d3.z + 0.55); } else { camera.position.set(1.6, 1.5, -2.6); camera.lookAt(0.8, 0.9, -5.6); }
     updateDummies(dt, t, hittersFor(inputs)); return;
   }
   if (VIEW === 'head' || VIEW === 'split') {   // close-ups: a torn-off head held up, or a dummy cut in half
