@@ -4,7 +4,8 @@ import * as THREE from 'three';
 import { VRButton } from './lib/VRButton.js';
 import { makeMonster } from './monster.js';
 import { initGore } from './gore.js';
-import { createVoice, setMouth, poseSelf } from './talk.js';
+import { createVoice, setMouth } from './talk.js';
+import { makeGorilla } from './gorilla.js';
 import { Reflector } from 'three/addons/objects/Reflector.js';
 
 // ---------------- tuning ----------------
@@ -256,12 +257,12 @@ function addSplat(pos, normal, size) {
 // Scruff, the player critter, and the tear-apart when you're caught
 const gore = await initGore(scene, addSplat);
 const voice = createVoice(); if (/faketalk/.test(location.search)) voice.setFake(true);
-let me = null; // your own ape body in VR (seen in the mirror, and your arms when you look down)
+let me = null; // your own gorilla body in VR (seen in the mirror, and your arms when you look down)
 // a mirror by the spawn point, so you can see your ape talk
 const mirror = new Reflector(new THREE.PlaneGeometry(2.4, 2.6), { textureWidth: 1024, textureHeight: 1024, color: 0xc4ccd0 });
 mirror.position.set(-3.2, 1.45, 8.3); mirror.rotation.y = Math.PI / 2; scene.add(mirror);
 add(new THREE.BoxGeometry(0.12, 2.9, 2.7), mat('#6b4a2b'), -3.27, 1.45, 8.3); colliders.push(boxCol(V(-3.33, 0, 6.95), V(-3.21, 2.9, 9.65)));
-{ const before = mirror.onBeforeRender; mirror.onBeforeRender = (r, sc, c) => { const h = me?.userData.parts.Head; if (h) h.visible = true; before(r, sc, c); if (h && renderer.xr.isPresenting) h.visible = false; }; }
+{ const before = mirror.onBeforeRender; mirror.onBeforeRender = (r, sc, c) => { if (me) me.hideHead(false); before(r, sc, c); if (me && renderer.xr.isPresenting) me.hideHead(true); }; }
 let dummy = null; const DUMMY_AT = V(0.6, 0, 7.4);
 function placeDummy() { if (dummy) return; dummy = gore.makeAvatar(); dummy.position.copy(DUMMY_AT); dummy.rotation.y = Math.PI; }
 function tearApart() {
@@ -271,7 +272,7 @@ function tearApart() {
     const a = gore.makeAvatar(); a.position.set(head.x, Math.max(0, head.y - 1.3), head.z); a.rotation.y = yaw + Math.PI; gore.dismember(a, push);
     rig.position.addScaledVector(push, 2.6).add(V(0, 1.4, 0)); vel.set(0, 0, 0); hands.forEach(h => h.stuck = null); // knocked back: watch it happen
   } else if (dummy) { gore.dismember(dummy, push); dummy = null; }
-  if (me) me.visible = false;
+  if (me) me.root.visible = false;
 }
 // red flash: an inside-out sphere around your head
 const flash = new THREE.Mesh(new THREE.SphereGeometry(0.25, 16, 12), new THREE.MeshBasicMaterial({ color: '#b00010', side: THREE.BackSide, transparent: true, opacity: 0, depthTest: false }));
@@ -306,7 +307,7 @@ function updateMonster(dt, t) {
     M.g.rotation.y = Math.atan2(head.x - M.g.position.x, head.z - M.g.position.z);
     if (M.timer > 0.4 && !M.torn) { M.torn = true; tearApart(); }
     if (M.timer > 1.6) { M.state = 'gone'; M.timer = 0; M.g.visible = false; if (renderer.xr.isPresenting) { rig.position.set(0, 0, 8); vel.set(0, 0, 0); hands.forEach(h => h.stuck = null); } }
-  } else if (M.state === 'gone' && M.timer > 4.5) { M.g.visible = true; M.torn = false; if (!renderer.xr.isPresenting) placeDummy(); if (me) me.visible = true; respawnMonster(); }
+  } else if (M.state === 'gone' && M.timer > 4.5) { M.g.visible = true; M.torn = false; if (!renderer.xr.isPresenting) placeDummy(); if (me) me.root.visible = true; respawnMonster(); }
   // fades
   flash.material.opacity = Math.max(0, flash.material.opacity - dt * 0.45);
   bloodyHands = Math.max(0, bloodyHands - dt * 0.08); handMat.color.set(HAND_C).lerp(new THREE.Color('#7a0008'), Math.min(1, bloodyHands)); palmMat.color.set(PALM_C).lerp(new THREE.Color('#8a0010'), Math.min(1, bloodyHands));
@@ -325,7 +326,7 @@ const info = document.getElementById('info');
 const demoCam = { pos: V(3.6, 2.1, 11.2) };
 const VIEW = new URLSearchParams(location.search).get('view');   // preview helpers: ?view=face or ?view=mirror
 function desktopPreview(t) {
-  if (VIEW && dummy) { monster.g.position.set(-15, 0, -15); monster.state = 'hunt'; monster.speed = 0; dummy.rotation.y = VIEW === 'face' ? 0.25 : -0.9;
+  if (VIEW && VIEW !== 'gorilla' && dummy) { monster.g.position.set(-15, 0, -15); monster.state = 'hunt'; monster.speed = 0; dummy.rotation.y = VIEW === 'face' ? 0.25 : -0.9;
     if (VIEW === 'face') { camera.position.set(DUMMY_AT.x + 0.35, 1.3, DUMMY_AT.z + 1.25); camera.lookAt(DUMMY_AT.x, 1.15, DUMMY_AT.z); }
     else { camera.position.set(1.6, 1.6, 10.6); camera.lookAt(-3.2, 1.2, 8.0); }
     return; }
@@ -333,20 +334,38 @@ function desktopPreview(t) {
   const target = DUMMY_AT.clone().setY(1.0); if (monster.g.visible && monster.state === 'hunt') target.lerp(monster.g.position.clone().setY(1.4), 0.35);
   camera.lookAt(target);
 }
+// ?view=gorilla : the player gorilla driven by a fake headset + controllers (for checking arms, wrists and fingers on a PC)
+let gp = null;
+function gorillaPreview(t, dt, talk) {
+  if (!gp) { gp = { head: new THREE.Object3D(), me: makeGorilla(scene), pads: [0, 1].map(() => ({ buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })) })) };
+    if (dummy) { scene.remove(dummy); dummy = null; } monster.g.position.set(-15, 0, -15); monster.speed = 0; scene.add(gp.head); if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none'); }
+  const H = V(0.6, 1.45, 7.4); gp.head.position.copy(H); gp.head.rotation.set(-0.15 * Math.sin(t * 0.7), 0.3 * Math.sin(t * 0.5), 0, 'YXZ'); gp.head.updateMatrixWorld(true);
+  const phase = Math.floor(t / 2.5) % 4;                    // 0 open, 1 fist, 2 point, 3 brace on a surface
+  const mk = (sx, i) => { const p = gp.pads[i]; const b = p.buttons;
+    b[0].value = phase === 1 ? 1 : 0; b[1].value = phase === 1 || phase === 2 ? 1 : 0; b[3].touched = phase === 1 || phase === 2;
+    const pos = H.clone().add(V(-sx * 0.38, -0.55 + 0.12 * Math.sin(t * 2 + i), -0.42));
+    const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(phase === 3 ? -1.4 : -0.5, 0, 0, 'YXZ'));
+    return { pos, quat, gamepad: p, stuck: phase === 3 }; };
+  gp.me.update({ camera: gp.head, hands: { L: mk(1, 0), R: mk(-1, 1) }, talk, dt });
+  const VA = new URLSearchParams(location.search).get('angle') || 'front';
+  const camAt = { front: V(0.6, 1.3, 5.0), side: V(2.8, 1.3, 6.9), hands: V(0.6, 1.15, 6.2) }[VA] || V(0.6, 1.3, 5.0);
+  camera.position.copy(camAt); camera.lookAt(0.6, VA === 'hands' ? 0.9 : 1.1, 7.4);
+}
 placeDummy();
-renderer.xr.addEventListener('sessionstart', () => { camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); rig.position.set(0, 0, 8); vel.set(0, 0, 0); respawnMonster(); if (dummy) { scene.remove(dummy); dummy = null; } voice.start(); if (!me) me = gore.makeAvatar(); if (info) info.style.display = 'none'; });
+renderer.xr.addEventListener('sessionstart', () => { camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); rig.position.set(0, 0, 8); vel.set(0, 0, 0); respawnMonster(); if (dummy) { scene.remove(dummy); dummy = null; } voice.start(); if (!me) me = makeGorilla(scene); me.root.visible = true; if (info) info.style.display = 'none'; });
 renderer.xr.addEventListener('sessionend', () => { if (info) info.style.display = ''; });
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 1 / 30); const t = clock.elapsedTime;
-  if (renderer.xr.isPresenting) { step(dt); updateHands(); } else desktopPreview(t);
+  if (renderer.xr.isPresenting) { step(dt); updateHands(); } else if (VIEW !== 'gorilla') desktopPreview(t);
   updateMonster(dt, t); gore.update(dt);
   const talk = voice.update(dt, t);
-  if (me && renderer.xr.isPresenting && me.visible) {
-    const hl = (hands.find(h => h.handed === 'left') || hands[0]).mesh.position, hr = (hands.find(h => h.handed === 'right') || hands[1]).mesh.position;
-    poseSelf(me, camera, hl, hr); setMouth(me, talk); me.userData.parts.Head.visible = false;   // your own head stays out of your eyes
-  }
+  if (me && renderer.xr.isPresenting && me.root.visible) {
+    const side = (name, i) => { const h = hands.find(x => x.handed === name) || hands[i]; return { pos: h.mesh.position, quat: h.mesh.quaternion, gamepad: h.gamepad, stuck: !!h.stuck }; };
+    me.update({ camera, hands: { L: side('left', 0), R: side('right', 1) }, talk, dt });
+    me.hideHead(true);                                   // your own head stays out of your eyes (the mirror shows it)
+  } else if (VIEW === 'gorilla') gorillaPreview(t, dt, talk);
   if (dummy) setMouth(dummy, talk);
   updateBananas(t);
   renderer.render(scene, camera);

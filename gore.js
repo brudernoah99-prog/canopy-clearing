@@ -4,8 +4,15 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 export async function initGore(scene, addSplat) {
-  const gltf = await new GLTFLoader().loadAsync('./models/ape.glb');
+  const gltf = await new GLTFLoader().loadAsync('./models/gorilla_parts.glb');
   gltf.scene.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  // the gorilla's parts are exported in place (origin at the feet): give each a pivot at its own centre so it tumbles naturally
+  for (const name of ['Body', 'Head', 'Arm_L', 'Arm_R']) {
+    const o = gltf.scene.getObjectByName(name); if (!o) continue;
+    const c = new THREE.Box3().setFromObject(o).getCenter(new THREE.Vector3());
+    const pivot = new THREE.Group(); pivot.name = name; pivot.position.copy(c); o.name = name + '_mesh';
+    gltf.scene.add(pivot); pivot.attach(o);
+  }
   const partsOf = (root) => { const p = {}; root.traverse(o => { if (['Body', 'Head', 'Arm_L', 'Arm_R'].includes(o.name)) p[o.name] = o; }); return p; };
   const makeAvatar = () => { const a = gltf.scene.clone(true); a.userData.parts = partsOf(a); scene.add(a); return a; };
 
