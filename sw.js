@@ -1,8 +1,8 @@
 // Offline cache: the game keeps working with no internet once it has loaded once.
-const CACHE = 'canopy-v16';
+const CACHE = 'canopy-v17';
 const FILES = ['./', './index.html', './game.js', './monster.js', './gore.js', './talk.js', './manifest.webmanifest',
   './lib/three.module.js', './lib/VRButton.js', './lib/addons/loaders/GLTFLoader.js', './lib/addons/utils/BufferGeometryUtils.js',
-  './lib/addons/objects/Reflector.js', './gorilla.js', './cyber.js', './slicer.js', './facility.js', './npc.js', './monster_weapons.js', './lib/addons/utils/SkeletonUtils.js', './models/gorilla.glb', './models/gorilla_parts.glb', './models/monster.glb', './icons/icon-192.png', './icons/icon-512.png'];
+  './lib/addons/objects/Reflector.js', './gorilla.js', './emotes.js', './cyber.js', './slicer.js', './facility.js', './npc.js', './monster_weapons.js', './lib/addons/utils/SkeletonUtils.js', './models/gorilla.glb', './models/ape_player.glb', './models/gorilla_parts.glb', './models/monster.glb', './icons/icon-192.png', './icons/icon-512.png'];
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (e) => e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener('fetch', (e) => {

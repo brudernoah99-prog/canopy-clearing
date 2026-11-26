@@ -8,7 +8,10 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 
-const gltf = await new GLTFLoader().loadAsync('./models/gorilla.glb');
+// two bodies on the same rig layout: 'ape' (the player: orange ape with 2 fingers + thumb) and 'gorilla' (NPCs, gore parts)
+const loader = new GLTFLoader();
+const MODELS = Object.fromEntries(await Promise.all([['ape', './models/ape_player.glb'], ['gorilla', './models/gorilla.glb']]
+  .map(async ([k, url]) => [k, await loader.loadAsync(url)])));
 const FINGERS = ['index', 'middle', 'ring', 'pinky', 'thumb'];
 const V = () => new THREE.Vector3(), Q = () => new THREE.Quaternion();
 const X = new THREE.Vector3(1, 0, 0), Yax = new THREE.Vector3(0, 1, 0), Z = new THREE.Vector3(0, 0, 1);
@@ -97,7 +100,8 @@ function layerShader(mat, U) {
   mat.customProgramCacheKey = () => 'gorilla-arm-layers';
 }
 
-export function makeGorilla(scene) {
+export function makeGorilla(scene, opts = {}) {
+  const gltf = MODELS[opts.model || 'ape'];
   const root = SkeletonUtils.clone(gltf.scene); scene.add(root);
   const B = {}; const headBits = []; const skinned = [];
   root.traverse(o => {
@@ -186,7 +190,8 @@ export function makeGorilla(scene) {
   // input: { camera, hands: {L: {pos, quat, gamepad, stuck}, R: ...}, talk, dt }
   const HEAD_REST = Q(); B.head.getWorldQuaternion(HEAD_REST);   // head bone's rest rotation (model facing +z)
   let tilt = 0;
-  function update({ camera, hands, talk = 0, dt = 1 / 72, floorY = -Infinity }) {
+  // body: optional emote extras { bob (m, body up/down under the head), twist (rad, chest turn), sway (rad, side lean) }
+  function update({ camera, hands, talk = 0, dt = 1 / 72, floorY = -Infinity, body = null }) {
     resetPose();
     const camPos = camera.getWorldPosition(V()), camQ = Q(); camera.getWorldQuaternion(camQ);
     const fwd = V().set(0, 0, -1).applyQuaternion(camQ); const yaw = Math.atan2(fwd.x, fwd.z);
@@ -194,8 +199,11 @@ export function makeGorilla(scene) {
     const room = camPos.y - floorY - 0.06; const want = room < EYE.y ? Math.acos(clamp(room / EYE.y, 0.15, 1)) : 0;
     tilt += (want - tilt) * Math.min(1, dt * 12);
     const yawQ = Q().setFromAxisAngle(Yax, yaw); root.quaternion.copy(yawQ).multiply(Q().setFromAxisAngle(X, tilt));
+    if (body && body.sway) root.quaternion.multiply(Q().setFromAxisAngle(Z, body.sway));
     root.position.copy(camPos).sub(EYE.clone().applyQuaternion(root.quaternion));
+    if (body && body.bob) root.position.y += body.bob;
     root.updateMatrixWorld(true);
+    if (body && body.twist && B.chest) { B.chest.quaternion.copy(rest.chest).multiply(Q().setFromAxisAngle(Yax, body.twist)); B.chest.updateMatrixWorld(true); }
     // head follows the headset (relative to the body's facing, whatever the body's tilt)
     const camYaw = Q().setFromAxisAngle(Yax, Math.atan2(-fwd.x, -fwd.z));
     const delta = camQ.clone().multiply(camYaw.invert());

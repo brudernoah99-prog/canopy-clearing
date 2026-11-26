@@ -208,7 +208,7 @@ export function makeMonsterNPC(scene, kind = 'ripper') {
 const FUR = ['#ffffff', '#d9c9bd', '#c7cfdc', '#e3d2b3'];
 let gCount = 0;
 export function makeGorillaNPC(scene, opts = {}) {
-  const Gr = makeGorilla(scene); const root = Gr.root;
+  const Gr = makeGorilla(scene, { model: 'gorilla' }); const root = Gr.root;
   const tint = opts.tint || FUR[gCount++ % FUR.length];
   if (tint !== '#ffffff') root.traverse(o => { if (o.isSkinnedMesh && o.material && !Array.isArray(o.material) && o.material.map) { o.material = o.material.clone(); o.material.color.multiply(new THREE.Color(tint)); } });
   const head = new THREE.Object3D(); scene.add(head);

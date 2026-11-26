@@ -10,6 +10,7 @@ import { createVoice } from './talk.js';
 import { makeGorilla, twoBoneIK } from './gorilla.js';
 import { Reflector } from 'three/addons/objects/Reflector.js';
 import { makeCyberArm } from './cyber.js';
+import { makeEmotes } from './emotes.js';
 
 // ---------------- tuning ----------------
 const T = {
@@ -321,6 +322,7 @@ const voice = createVoice(); if (/faketalk/.test(location.search)) voice.setFake
 
 // ---------------- you: the gorilla ----------------
 const me = makeGorilla(scene); me.root.visible = false;
+const emotes = makeEmotes();   // hold B (right controller) to emote; right stick up/down while holding switches
 const VIEW = new URLSearchParams(location.search).get('view');   // desktop test views: rip, monster, dummies
 
 // ---------------- ripping your own arm off, and the arms lying around ----------------
@@ -726,13 +728,13 @@ function updateScale(dt) {
 { const before = mirror.onBeforeRender; mirror.onBeforeRender = (r, sc, c) => { me.hideHead(false); beast.head.visible = true; before(r, sc, c); if (renderer.xr.isPresenting) { me.hideHead(true); beast.head.visible = false; } }; }
 
 // ---------------- one frame of you (works for the headset, and for the PC test views) ----------------
-function updateAvatar(head, inputs, dt, t, talk) {
+function updateAvatar(head, inputs, dt, t, talk, body = null) {
   if (mode === 'monster') { updateBeast(head, inputs, dt, t, talk); for (const s of ['L', 'R']) if (cyber[s]) cyber[s].setVisible(false); }
   else if (me.root.visible) {
     // the floor (or whatever you're over) under your head, so the body can stay above it
     const hp = head.getWorldPosition(V()); const probe = V(hp.x, hp.y - me.EYE.y, hp.z); const c = contact(probe, 0);
     const floorY = (c.dist < 0.02 && c.normal.y > 0.6) ? c.point.y : -Infinity;
-    me.update({ camera: head, hands: inputs, talk, dt, floorY });
+    me.update({ camera: head, hands: inputs, talk, dt, floorY, body });
   }
 }
 function hittersFor(inputs) {
@@ -934,6 +936,17 @@ function desktopView(t, dt, talk) {
     camera.position.set(POD.x - 0.1, 1.35, POD.z + 0.1); camera.rotation.set(0, Math.PI, 0); camera.updateMatrixWorld(true);
     if (!fake.pod) { fake.pod = true; me.rip('R'); } updatePod(dt, t, camera.getWorldPosition(V())); updateDummies(dt, t, []); return;
   }
+  if (VIEW === 'emote') {   // ?view=emote (cycles every 6 s) or ?view=emote&e=0|1|2 : the ape doing an emote, seen from the front
+    if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
+    if (!me.root.visible) me.root.visible = true;
+    const qs = new URLSearchParams(location.search); const idx = qs.get('e') !== null ? +qs.get('e') : Math.floor(t / 6) % emotes.EMOTES.length;
+    emotes.force(true, idx);
+    const inp = fakeInputs(t, dt); fake.head.rotation.set(0, 0, 0); fake.head.updateMatrixWorld(true);
+    const e = emotes.apply(fake.head, inp, dt);
+    updateAvatar(fake.head, e.inputs, dt, t, talk, e.body);
+    const H = fake.head.position; camera.position.set(H.x + 0.6, H.y - 0.2, H.z - 2.4); camera.lookAt(H.x, H.y - 0.45, H.z);
+    updateDummies(dt, t, []); return;
+  }
   if (VIEW === 'rip' || VIEW === 'monster') {
     if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
     if (VIEW === 'monster' && mode !== 'monster') setMode('monster');
@@ -1043,7 +1056,13 @@ renderer.setAnimationLoop(() => {
   if (renderer.xr.isPresenting) {
     updateScale(dt); step(dt); updateHands(dt); updateRipping(dt);
     const inputs = {}; for (const s of ['L', 'R']) { const h = handOf(s); inputs[s] = { pos: h.mesh.position, quat: h.mesh.quaternion, gamepad: h.gamepad, stuck: !!h.stuck, vel: h.vel, h }; }
-    updateAvatar(camera, inputs, dt, t, talk);
+    // emotes: hold B on the right controller (ape only; in monster mode B is the saw)
+    let avIn = inputs, avBody = null;
+    if (mode === 'gorilla' && me.root.visible) {
+      emotes.input(handOf('R')?.gamepad, dt); const e = emotes.apply(camera, inputs, dt); avIn = e.inputs; avBody = e.body;
+      if (emotes.state.changed) showBanner(emotes.state.changed, 'right stick up/down: next emote', '#ffd23a', 1.6);
+    }
+    updateAvatar(camera, avIn, dt, t, talk, avBody);
     if (mode === 'gorilla') me.hideHead(true); else beast.head.visible = false;
     updateCyberArms(dt, t, inputs, mode === 'gorilla'); updateCyberWeapons(dt);
     updateDummies(dt, t, hittersFor(inputs));
