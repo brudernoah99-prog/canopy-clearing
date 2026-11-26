@@ -184,16 +184,22 @@ export function makeGorilla(scene) {
   }
 
   // input: { camera, hands: {L: {pos, quat, gamepad, stuck}, R: ...}, talk, dt }
-  function update({ camera, hands, talk = 0, dt = 1 / 72 }) {
+  const HEAD_REST = Q(); B.head.getWorldQuaternion(HEAD_REST);   // head bone's rest rotation (model facing +z)
+  let tilt = 0;
+  function update({ camera, hands, talk = 0, dt = 1 / 72, floorY = -Infinity }) {
     resetPose();
     const camPos = camera.getWorldPosition(V()), camQ = Q(); camera.getWorldQuaternion(camQ);
     const fwd = V().set(0, 0, -1).applyQuaternion(camQ); const yaw = Math.atan2(fwd.x, fwd.z);
-    root.rotation.set(0, yaw, 0); root.position.copy(camPos).sub(EYE.clone().applyAxisAngle(Yax, yaw));
+    // keep the body out of the floor: if your head is lower than the gorilla is tall, the body swings back behind you at the neck
+    const room = camPos.y - floorY - 0.06; const want = room < EYE.y ? Math.acos(clamp(room / EYE.y, 0.15, 1)) : 0;
+    tilt += (want - tilt) * Math.min(1, dt * 12);
+    const yawQ = Q().setFromAxisAngle(Yax, yaw); root.quaternion.copy(yawQ).multiply(Q().setFromAxisAngle(X, tilt));
+    root.position.copy(camPos).sub(EYE.clone().applyQuaternion(root.quaternion));
     root.updateMatrixWorld(true);
-    // head follows the headset (relative to the body's facing)
+    // head follows the headset (relative to the body's facing, whatever the body's tilt)
     const camYaw = Q().setFromAxisAngle(Yax, Math.atan2(-fwd.x, -fwd.z));
     const delta = camQ.clone().multiply(camYaw.invert());
-    const hq = Q(); B.head.getWorldQuaternion(hq); setWorldQuat(B.head, delta.multiply(hq));
+    setWorldQuat(B.head, delta.multiply(yawQ.clone().multiply(HEAD_REST)));
     // arms: IK to the controllers, wrists follow controller rotation
     for (const s of ['L', 'R']) {
       const h = hands[s]; if (!h || !h.pos) continue;

@@ -343,11 +343,15 @@ function updateCyberArms(dt, t, inputs, show) {
   for (const L of limbs) if (L.cyber) L.cyber.update({ dt, t });
 }
 // chainsaw: while revving, whatever the bar touches comes off (a body gets cut in half); hammer: a hard hit turns a dummy into little pieces
+function activeWeapons() {
+  if (mode === 'monster') return (beast.weapons || []).filter(w => w.ready);
+  return ['L', 'R'].map(s => cyber[s]).filter(C => C && C.attached && C.built >= 1);
+}
 function updateCyberWeapons(dt) {
-  for (const s of ['L', 'R']) { const C = cyber[s]; if (!C || !C.attached || C.built < 1) continue; const h = handOf(s);
+  for (const C of activeWeapons()) { const s = C.side; const h = handOf(s);
     if (C.type === 'chainsaw' && C.rev > 0.5) {
       const pts = C.cutPoints();
-      for (const d of dummies) { d.cutCd = Math.max(0, (d.cutCd || 0) - dt); if (!d.a || d.grow < 1 || d.cutCd > 0) continue;
+      for (const d of allDummies()) { d.cutCd = Math.max(0, (d.cutCd || 0) - dt); if (!d.a || d.grow < 1 || d.cutCd > 0) continue;
         for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const part = d.a.userData.parts[name]; if (!part || !part.userData.lb) continue; const c = part.getWorldPosition(V());
           const [mn, mx] = part.userData.lb; const m = name === 'Body' ? 0.0 : 0.04;   // is any point of the bar inside this part's box?
           const hit = pts.find(p => { const q = part.worldToLocal(p.clone()); return q.x > mn[0] - m && q.x < mx[0] + m && q.y > mn[1] - m && q.y < mx[1] + m && q.z > mn[2] - m && q.z < mx[2] + m; }); if (!hit) continue;
@@ -364,23 +368,24 @@ function updateCyberWeapons(dt) {
       const path = [0, 0.25, 0.5, 0.75, 1].map(u => hp.clone().addScaledVector(C.tipVel, -dt * u));
       const inBox = (part, p, m) => { if (!part || !part.userData.lb) return false; const [mn, mx] = part.userData.lb; const q = part.worldToLocal(p.clone());
         return q.x > mn[0] - m && q.x < mx[0] + m && q.y > mn[1] - m && q.y < mx[1] + m && q.z > mn[2] - m && q.z < mx[2] + m; };
-      for (const d of dummies) { if (!d.a || d.grow < 1) continue;
-        if (sp > 3.0 && Object.values(d.a.userData.parts).some(part => path.some(p => inBox(part, p, 0.1)))) { gore.dismember(d.a, C.tipVel.clone().setY(0).normalize(), { pulp: true }); d.a = null; d.respawn = 4.5; d.tornT = undefined; if (h) pulse(h, 1, 300); } }
+      for (const d of allDummies()) { if (!d.a || d.grow < 1) continue;
+        if (sp > 3.0 && Object.values(d.a.userData.parts).some(part => path.some(p => inBox(part, p, 0.1)))) { smashDummy(d, C.tipVel.clone(), false, true); if (h) pulse(h, 1, 300); } }
     }
   }
 }
 // ---------------- the regen pod's choice: regrow with cyber? ----------------
 const choice = { side: null, grp: null, buttons: [], dwell: null, dwellT: 0, cool: 0 };
 function closeChoice() { if (choice.grp) scene.remove(choice.grp); choice.grp = null; choice.side = null; choice.buttons = []; choice.dwell = null; choice.dwellT = 0; }
-function openChoice(s) {
-  closeChoice(); choice.side = s;
+function openChoice(s, kindSet = 'arm') {
+  closeChoice(); choice.side = s; choice.kind = kindSet;
   const head = camera.getWorldPosition(V()); const f = camera.getWorldDirection(V()).setY(0); if (f.lengthSq() < 1e-4) f.set(0, 0, -1); f.normalize();
   const g = new THREE.Group(); g.position.copy(head).addScaledVector(f, 0.55).add(V(0, -0.22, 0)); g.lookAt(head.x, g.position.y, head.z); scene.add(g); choice.grp = g;
   const title = canvasTex(1024, 200, (c, W, H) => { c.fillStyle = 'rgba(10,14,18,0.9)'; c.fillRect(0, 0, W, H); c.strokeStyle = '#29c8ff'; c.lineWidth = 8; c.strokeRect(4, 4, W - 8, H - 8);
-    c.fillStyle = '#7fe8ff'; c.font = '900 64px Arial'; c.textAlign = 'center'; c.fillText(`REGROW YOUR ${s === 'L' ? 'LEFT' : 'RIGHT'} ARM WITH CYBER?`, W / 2, 95, W - 40);
+    c.fillStyle = '#7fe8ff'; c.font = '900 64px Arial'; c.textAlign = 'center'; c.fillText(kindSet === 'monster' ? 'CHOOSE YOUR MONSTER' : `REGROW YOUR ${s === 'L' ? 'LEFT' : 'RIGHT'} ARM WITH CYBER?`, W / 2, 95, W - 40);
     c.fillStyle = '#ccc'; c.font = '600 38px Arial'; c.fillText('touch a button (or look at one)', W / 2, 160); });
   const tm = new THREE.Mesh(new THREE.PlaneGeometry(0.75, 0.146), new THREE.MeshBasicMaterial({ map: title, transparent: true })); tm.position.y = 0.17; g.add(tm);
-  [['normal', 'NORMAL', '#3dff7c'], ['chainsaw', 'CHAINSAW', '#ff7a2a'], ['hammer', 'HAMMER', '#ffd23a']].forEach(([kind, label, col], i) => {
+  (kindSet === 'monster' ? [['classic', 'CLASSIC', '#ff3a3a'], ['hammer', 'BONE HAMMER', '#e8dcc4'], ['chainsaw', 'CHAINSAW ARM', '#ff7a2a']]
+    : [['normal', 'NORMAL', '#3dff7c'], ['chainsaw', 'CHAINSAW', '#ff7a2a'], ['hammer', 'HAMMER', '#ffd23a']]).forEach(([kind, label, col], i) => {
     const tex = canvasTex(256, 160, (c, W, H) => { c.fillStyle = '#14181d'; c.fillRect(0, 0, W, H); c.strokeStyle = col; c.lineWidth = 12; c.strokeRect(6, 6, W - 12, H - 12); c.fillStyle = col; c.font = '900 40px Arial'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(label, W / 2, H / 2, W - 30); });
     const b = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.14, 0.04), [dark2, dark2, dark2, dark2, new THREE.MeshBasicMaterial({ map: tex }), dark2]); b.position.set((i - 1) * 0.25, 0, 0); g.add(b);
     const ring = new THREE.Mesh(new THREE.RingGeometry(0.02, 0.028, 24), new THREE.MeshBasicMaterial({ color: col })); ring.position.set((i - 1) * 0.25, -0.1, 0.022); ring.scale.setScalar(0.001); g.add(ring);
@@ -390,6 +395,7 @@ function openChoice(s) {
 }
 const dark2 = new THREE.MeshStandardMaterial({ color: '#2a2e33', metalness: 0.6, roughness: 0.5 });
 function pickChoice(kind) {
+  if (choice.kind === 'monster') { closeChoice(); choice.cool = 0.6; if (beast.setVariant) beast.setVariant(kind); setMode('monster'); return; }
   const s = choice.side; closeChoice(); choice.cool = 0.6;
   if (kind === 'normal') { me.regrow(s); podBusy = me.GROW_TIME || 8; } else { giveCyberArm(s, kind); podBusy = 3.2; }
   hands.forEach(h => pulse(h, 0.8, 120)); gore.sfx('thud', 0.5);
@@ -427,14 +433,46 @@ function ripArm(s, by) {
 }
 function addLimb(r, by) {
   const L = { o: r.o, vel: V(), spin: V(), heldBy: null, offset: null, t: 0, jointLocal: r.jointLocal, dirLocal: r.dirLocal, rope: r.rope || null }; limbs.push(L);
-  if (limbs.length > 8) { const old = limbs.shift(); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); if (old.cyber) old.cyber.dispose(); }
+  if (limbs.length > 10) { const old = limbs.find(l => !l.heldBy) || limbs[0]; limbs.splice(limbs.indexOf(old), 1); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); if (old.cyber) old.cyber.dispose();
+    if (old.dummy) { const j = looseDummies.indexOf(old.dummy); if (j >= 0) looseDummies.splice(j, 1); if (old.dummy.a) bleedingCheck(old.dummy.a); } }
   if (by) hold(L, by);
   return L;
 }
+function bleedingCheck(a) { if (a.parent) a.parent.remove(a); }
 // grabbing a test dummy's head or arm
+// dummies you picked up: the whole avatar hangs in a pivot that the limb system carries and throws
+const looseDummies = [];
+const allDummies = () => dummies.concat(looseDummies);
+function pickUpDummy(d, h) {
+  const a = d.a; a.scale.setScalar(DUMMY_SCALE); a.rotation.set(0, a.rotation.y, 0); a.updateMatrixWorld(true);
+  const body = a.userData.parts.Body; const c = body ? body.getWorldPosition(V()) : a.getWorldPosition(V()).add(V(0, 0.65, 0));
+  const pivot = new THREE.Group(); pivot.position.copy(c); scene.add(pivot); pivot.attach(a);
+  const entry = { a, grow: 1, at: c.clone(), loose: true, limb: null, tornT: d.tornT };
+  const L = addLimb({ o: pivot, jointLocal: null, dirLocal: null }, null); L.radius = 0.28; L.dummy = entry; entry.limb = L; hold(L, h);
+  looseDummies.push(entry);
+  d.a = null; d.respawn = 3; d.tornT = undefined;   // a fresh one appears on the stand
+  gore.sfx('thud', 0.4); pulse(h, 0.6, 80);
+}
+function unpinLoose(d) {   // take a loose dummy out of its pivot (before it gets torn apart)
+  const L = d.limb; if (L) { if (L.heldBy) L.heldBy.holding = null; const i = limbs.indexOf(L); if (i >= 0) limbs.splice(i, 1); }
+  if (d.a) scene.attach(d.a); if (L) scene.remove(L.o);
+  const j = looseDummies.indexOf(d); if (j >= 0) looseDummies.splice(j, 1);
+}
+function updateLooseDummies(dt, hitters) {
+  for (const d of looseDummies.slice()) {
+    if (!d.a || !d.a.parent) { unpinLoose(d); continue; }
+    const body = d.a.userData.parts.Body; d.at.copy(body ? body.getWorldPosition(V()) : d.limb.o.position).add(V(0, -0.75 * DUMMY_SCALE, 0));
+    if (d.tornT !== undefined) d.tornT += dt;
+    // punches / tools knock it around
+    const c = d.at.clone().add(V(0, 0.75 * DUMMY_SCALE, 0));
+    if (!d.limb.heldBy) for (const hit of hitters) { if (hit.h && hit.h === d.limb.heldBy) continue; const sp = hit.vel.length();
+      if (hit.pos.distanceTo(c) < 0.4 && sp > hit.speed) { d.limb.vel.addScaledVector(hit.vel, 0.6).add(V(0, 1, 0)); d.limb.spin.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+        gore.spurt(hit.pos.clone(), hit.vel.clone().normalize(), 8, 1 + sp * 0.3); gore.sfx('thud', Math.min(1, sp / 6)); if (hit.h && hit.h.gamepad) pulse(hit.h, 0.6, 60); break; } }
+  }
+}
 function dummyPartNear(p) {
   let best = null, bd = Infinity;
-  for (const d of dummies) { if (!d.a || d.grow < 1) continue;
+  for (const d of allDummies()) { if (!d.a || d.grow < 1) continue;
     for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const part = d.a.userData.parts[name]; if (!part) continue; const dist = part.getWorldPosition(V()).distanceTo(p);
       const reach = { Head: 0.23, Arm_L: 0.27, Arm_R: 0.27, Body: 0.36 }[name];
       if (dist < reach && dist - (name === 'Body' ? 0.12 : 0) < bd) { bd = dist - (name === 'Body' ? 0.12 : 0); best = { dummy: d, part: name, d0: dist }; } } }
@@ -475,10 +513,15 @@ function pullDummy(h, p) {
       if (sep - G.sep0 > 0.28) { d.a.scale.setScalar(DUMMY_SCALE); const push = p.clone().sub(op).setY(0); h.ripGrab = null; other.ripGrab = null; smashDummy(d, V(push.z, 0, -push.x), true); hands.forEach(x => pulse(x, 1, 300)); }
       return;
     }
-    G.sep0 = undefined; if (d.grow >= 1) d.a.scale.setScalar(DUMMY_SCALE);
-    const k = clamp(pull / 0.5, 0, 1); if (k > 0.05) pulse(h, 0.15 + 0.6 * k, 20);
-    d.w && (d.w.x += (p.z - restW.z) * 0.02, d.w.z += -(p.x - restW.x) * 0.02);
-    if (pull > 0.5) { h.ripGrab = null; smashDummy(d, p.clone().sub(restW), false); }   // yanked hard enough: it comes apart
+    G.sep0 = undefined; if (d.grow >= 1 && !d.loose) d.a.scale.setScalar(DUMMY_SCALE);
+    if (d.loose) {   // a dummy lying around or carried: pick it up, or (if the other hand is carrying it) yank it in half
+      const holder = d.limb.heldBy;
+      if (!holder) { h.ripGrab = null; hold(d.limb, h); pulse(h, 0.5, 60); return; }
+      const k = clamp(pull / 0.32, 0, 1); if (k > 0.05) { pulse(h, 0.2 + 0.8 * k, 20); pulse(holder, 0.2 + 0.8 * k, 20); }
+      if (pull > 0.32) { h.ripGrab = null; smashDummy(d, p.clone().sub(restW), true); hands.forEach(x => pulse(x, 1, 300)); }
+      return;
+    }
+    if (pull > 0.1) { h.ripGrab = null; pickUpDummy(d, h); }   // lift the whole thing off its stand, in one piece
     return;
   }
   const k = clamp(pull / 0.24, 0, 1);
@@ -525,8 +568,8 @@ function updateLimbs(dt) {
     else {
       L.vel.y -= 9.8 * dt; o.position.addScaledVector(L.vel, dt);
       o.rotation.x += L.spin.x * dt; o.rotation.y += L.spin.y * dt; o.rotation.z += L.spin.z * dt;
-      const c = contact(o.position, 0.11);
-      if (c.dist < 0.11) { o.position.copy(c.rest); const vn = L.vel.dot(c.normal); if (vn < 0) { if (vn < -2) addSplat(c.point, c.normal, 0.35 + Math.random() * 0.3); L.vel.addScaledVector(c.normal, -1.3 * vn); } L.vel.multiplyScalar(0.72); L.spin.multiplyScalar(0.6); }
+      const lr = L.radius || 0.11; const c = contact(o.position, lr);
+      if (c.dist < lr) { o.position.copy(c.rest); const vn = L.vel.dot(c.normal); if (vn < 0) { if (vn < -2) addSplat(c.point, c.normal, 0.35 + Math.random() * 0.3); L.vel.addScaledVector(c.normal, -1.3 * vn); } L.vel.multiplyScalar(0.72); L.spin.multiplyScalar(0.6); }
     }
     // a spine still inside the body: the controller buzzes harder the further it's pulled out, then a jolt when it pops free
     if (L.rope) { if (L.rope.attached && L.heldBy) pulse(L.heldBy, 0.1 + 0.6 * L.rope.tension, 20); if (L.rope.popped) { L.rope.popped = false; if (L.heldBy) pulse(L.heldBy, 1, 200); } }
@@ -551,7 +594,8 @@ function updatePod(dt, t, headPos) {
   const inPod = Math.hypot(headPos.x - POD.x, headPos.z - POD.z) < 0.9 && headPos.y < 3.2 && mode === 'gorilla';
   choice.cool = Math.max(0, choice.cool - dt);
   if (inPod && !choice.grp && choice.cool <= 0) { const s = ['L', 'R'].find(x => me.armGone(x)); if (s) openChoice(s); }
-  if (!inPod && choice.grp) closeChoice();
+  if (!inPod && choice.grp && choice.kind === 'arm') closeChoice();
+  if (choice.grp && choice.kind === 'monster' && headPos.distanceTo(V(BTN.x, 1.2, BTN.z)) > 2.6) closeChoice();
   updateChoice(dt);
   podBusy = Math.max(0, podBusy - dt);
   const k = podBusy > 0 ? 1 : 0;
@@ -571,11 +615,14 @@ const DUMMY_SCALE = 0.85;   // the same size as your gorilla when you're on the 
 const dummies = DUMMY_SPOTS.map(at => ({ at, a: null, grow: 1, respawn: 0 }));
 function spawnDummy(d) { d.a = gore.makeAvatar(); d.a.position.copy(d.at); d.a.scale.setScalar(0.01); d.grow = 0; }
 dummies.forEach(spawnDummy);
-function smashDummy(d, push, split = false) {
-  if (!d.a) return; d.a.scale.setScalar(DUMMY_SCALE); d.a.updateMatrixWorld(true);
-  gore.dismember(d.a, push.clone().setY(0).normalize(), { split }); d.a = null; d.respawn = 4.5; d.tornT = undefined;
+function smashDummy(d, push, split = false, pulp = false) {
+  if (!d.a) return; const a = d.a;
+  if (d.loose) unpinLoose(d); else a.scale.setScalar(DUMMY_SCALE);
+  a.updateMatrixWorld(true); const dir = push.clone().setY(0); if (dir.lengthSq() < 1e-6) dir.set(0, 0, 1);
+  gore.dismember(a, dir.normalize(), { split, pulp }); d.a = null; d.respawn = 4.5; d.tornT = undefined;
 }
 function updateDummies(dt, t, hitters) {
+  updateLooseDummies(dt, hitters);
   dummies.forEach((d, i) => {
     if (!d.a) { d.respawn -= dt; if (d.respawn <= 0) spawnDummy(d); return; }
     if (d.grow < 1) { d.grow = Math.min(1, d.grow + dt / 0.9); d.a.scale.setScalar(Math.max(0.01, easeOutBack(d.grow, 1.6)) * DUMMY_SCALE); }
@@ -619,7 +666,7 @@ function setMode(m) {
 let btnArmed = true, btnPress = 0;
 function updateButton(dt, t, points) {
   const top = V(BTN.x, 1.09, BTN.z); const near = points.some(p => p.distanceTo(top) < 0.14 * rig.scale.x);
-  if (near && btnArmed) { btnArmed = false; btnPress = 1; setMode(mode === 'monster' ? 'gorilla' : 'monster'); }
+  if (near && btnArmed) { btnArmed = false; btnPress = 1; if (mode === 'monster') setMode('gorilla'); else if (renderer.xr.isPresenting && beast.setVariant) openChoice(null, 'monster'); else setMode('monster'); }
   if (!points.some(p => p.distanceTo(top) < 0.3 * rig.scale.x)) btnArmed = true;
   btnPress = Math.max(0, btnPress - dt * 3); btnCap.position.y = 1.05 - 0.035 * btnPress;
   btnCap.material.emissiveIntensity = 0.6 + 0.4 * Math.sin(t * 4) + btnPress * 2; btnLight.intensity = 1 + 0.5 * Math.sin(t * 4);
@@ -665,7 +712,12 @@ function updateScale(dt) {
 // ---------------- one frame of you (works for the headset, and for the PC test views) ----------------
 function updateAvatar(head, inputs, dt, t, talk) {
   if (mode === 'monster') { updateBeast(head, inputs, dt, t, talk); for (const s of ['L', 'R']) if (cyber[s]) cyber[s].setVisible(false); }
-  else if (me.root.visible) me.update({ camera: head, hands: inputs, talk, dt });
+  else if (me.root.visible) {
+    // the floor (or whatever you're over) under your head, so the body can stay above it
+    const hp = head.getWorldPosition(V()); const probe = V(hp.x, hp.y - me.EYE.y, hp.z); const c = contact(probe, 0);
+    const floorY = (c.dist < 0.02 && c.normal.y > 0.6) ? c.point.y : -Infinity;
+    me.update({ camera: head, hands: inputs, talk, dt, floorY });
+  }
 }
 function hittersFor(inputs) {
   const out = [];
@@ -681,7 +733,7 @@ function hittersFor(inputs) {
 const info = document.getElementById('info');
 const fake = { head: new THREE.Object3D(), pads: [0, 1].map(() => ({ buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })) })), prev: {}, cycle: -1 };
 scene.add(fake.head);
-function fakeInputs(t, dt, H = V(0.6, 1.45, 7.4)) { fake.head.position.copy(H); fake.head.rotation.set(-0.1 * Math.sin(t * 0.7), 0.25 * Math.sin(t * 0.5), 0, 'YXZ'); fake.head.updateMatrixWorld(true);
+function fakeInputs(t, dt, H = V(0.6, +(new URLSearchParams(location.search).get('headY') || 1.45), 7.4)) { fake.head.position.copy(H); fake.head.rotation.set(-0.1 * Math.sin(t * 0.7), 0.25 * Math.sin(t * 0.5), 0, 'YXZ'); fake.head.updateMatrixWorld(true);
   const inp = {};
   for (const [s, sx, i] of [['L', 1, 0], ['R', -1, 1]]) {
     const pos = H.clone().add(V(-sx * 0.38, -0.5 + 0.12 * Math.sin(t * 2 + i), -0.45));
@@ -745,6 +797,22 @@ function desktopView(t, dt, talk) {
         else smashDummy(d, V(Math.random() - 0.5, 0, 1), kind === 1); } }
     updateDummies(dt, t, []); return;
   }
+  if (VIEW === 'carry') {   // 2.5 s grab dummy 3's body with the right hand and lift it, 5 s throw it; 7 s grab it off the floor, 8.5 s the left hand yanks it in half
+    if (info) info.style.display = 'none';
+    const [hl, hr] = [hands[0], hands[1]]; hl.handed = 'left'; hr.handed = 'right';
+    for (const h of [hl, hr]) if (!h.gamepad) h.gamepad = { buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })), hapticActuators: [] };
+    const d3 = dummies[2].at; const sm = (a, b, x) => sstep(a, b, x);
+    let pl = V(-1.0, 1.0, -4.0), pr = V(1.0, 1.0, -4.0), gl = 0, gr = 0;
+    const body = V(d3.x, 0.95, d3.z + 0.12);
+    if (t > 2 && t < 5.2) { pr = body.clone().lerp(V(d3.x + 0.3, 1.5, d3.z + 1.2), sm(3.0, 4.2, t)); if (t > 4.6) pr.add(V(0.8 * sm(4.6, 5.0, t), 0.2, 0.6 * sm(4.6, 5.0, t))); gr = t < 5.0 && t > 2.5 ? 1 : 0; }
+    const L = looseDummies[0];
+    if (t > 6.2 && L) { const at = L.limb.o.position; if (!fake.carryAt || t < 6.6) fake.carryAt = at.clone(); pr = fake.carryAt.clone().add(V(0, 0.05 + 0.5 * sm(7.0, 7.8, t), 0)); gr = t > 6.6 ? 1 : 0;
+      if (t > 8.0) { const bc = L.a.userData.parts.Body ? L.a.userData.parts.Body.getWorldPosition(V()) : at; if (!fake.lAt) fake.lAt = bc.clone().add(V(-0.15, 0, 0.05)); pl = fake.lAt.clone().add(V(-0.5 * sm(8.6, 9.2, t), 0, 0)); gl = t > 8.2 ? 1 : 0; } }
+    for (const [h, p, g] of [[hl, pl, gl], [hr, pr, gr]]) { const prev = h.mesh.position.clone(); h.mesh.position.copy(p); h.vel.copy(p).sub(prev).divideScalar(Math.max(dt, 1e-3)); h.gamepad.buttons[1].value = g; }
+    updateRipping(dt);
+    camera.position.set(2.0, 1.7, -1.6); camera.lookAt(0, 0.9, -5.0);
+    updateDummies(dt, t, []); return;
+  }
   if (VIEW === 'grab') {   // the real grab code with fake hands: 1.5 s grab dummy 3's head and pull; 4.5 s both hands pull dummy 4 apart; 7 s punch dummy 2
     if (info) info.style.display = 'none';
     const [hl, hr] = [hands[0], hands[1]]; hl.handed = 'left'; hr.handed = 'right';
@@ -788,7 +856,7 @@ renderer.setAnimationLoop(() => {
     const inputs = {}; for (const s of ['L', 'R']) { const h = handOf(s); inputs[s] = { pos: h.mesh.position, quat: h.mesh.quaternion, gamepad: h.gamepad, stuck: !!h.stuck, vel: h.vel, h }; }
     updateAvatar(camera, inputs, dt, t, talk);
     if (mode === 'gorilla') me.hideHead(true); else beast.head.visible = false;
-    updateCyberArms(dt, t, inputs, mode === 'gorilla'); if (mode === 'gorilla') updateCyberWeapons(dt);
+    updateCyberArms(dt, t, inputs, mode === 'gorilla'); updateCyberWeapons(dt);
     updateDummies(dt, t, hittersFor(inputs));
     const pts = mode === 'monster' ? ['L', 'R'].map(beastHandPos) : hands.filter(canPush).map(h => h.mesh.position);
     updateButton(dt, t, pts); updateGoreSwitch(dt, pts);
@@ -801,4 +869,4 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 document.getElementById('mic')?.addEventListener('click', async (e) => { e.target.textContent = (await voice.start()) ? 'Mic on: talk!' : 'No mic found'; });
-window.GAME = { cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };
+window.GAME = { looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };
