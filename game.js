@@ -108,7 +108,8 @@ function cylCol(cx, cz, R, y0, y1) {
 }
 function contact(p, r) {
   let best = null;
-  for (const c of colliders) {
+  const list = (p.x > 100 && facColliders.length) ? facColliders : colliders;   // the big facility sits far away at x = 200
+  for (const c of list) {
     const s = c.surf(p); const dist = s.inside ? -p.distanceTo(s.point) : p.distanceTo(s.point);
     if (!best || dist < best.dist) best = { dist, point: s.point, normal: s.normal };
   }
@@ -743,6 +744,152 @@ function hittersFor(inputs) {
   return out;
 }
 
+// ---------------- game modes: SANDBOX (this hall), ESCAPE (run from 3 monsters in the big facility), BE THE MONSTER (hunt NPC gorillas) ----------------
+const facColliders = [];
+const G7 = { mode: 'sandbox', phase: 'idle', t: 0, fac: null, monsters: [], npcs: [], keycards: [], keys: 0, caught: 0, total: 0, endT: 0, msg: '', loading: false, quitHold: 0 };
+const LOBBY_SPAWN = V(0, 0, 8);
+async function ensureFacility() {
+  if (G7.fac) return G7.fac;
+  const m = await import('./facility.js'); const fac = m.buildFacility(scene);
+  fac.colliders.forEach(c => facColliders.push(c)); G7.fac = fac; return fac;
+}
+let NPCmod = null; async function ensureNPC() { if (!NPCmod) NPCmod = await import('./npc.js'); return NPCmod; }
+function teleport(feet, yaw = 0) {
+  rig.rotation.y = yaw; rig.updateMatrixWorld(true);
+  const off = camera.position.clone().setY(0).applyAxisAngle(V(0, 1, 0), yaw);
+  rig.position.set(feet.x - off.x, feet.y, feet.z - off.z); vel.set(0, 0, 0); history.length = 0; hands.forEach(h => { h.stuck = null; if (h.holding) release(h); h.ripGrab = null; });
+}
+// big message in front of you
+const banner = (() => { const c = document.createElement('canvas'); c.width = 1024; c.height = 400; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.43), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); m.renderOrder = 31; m.visible = false; scene.add(m);
+  return { m, c, t, until: 0 }; })();
+function showBanner(title, sub = '', col = '#ffd23a', secs = 3) {
+  const g = banner.c.getContext('2d'); g.clearRect(0, 0, 1024, 400); g.fillStyle = 'rgba(10,10,12,0.85)'; g.fillRect(0, 0, 1024, 400); g.strokeStyle = col; g.lineWidth = 12; g.strokeRect(6, 6, 1012, 388);
+  g.fillStyle = col; g.textAlign = 'center'; g.font = '900 110px Arial'; g.fillText(title, 512, 175, 980); g.fillStyle = '#eee'; g.font = '700 50px Arial'; g.fillText(sub, 512, 290, 980);
+  banner.t.needsUpdate = true; banner.until = clock.elapsedTime + secs; banner.m.visible = true;
+}
+function updateBanner() {
+  if (!banner.m.visible) return; if (clock.elapsedTime > banner.until) { banner.m.visible = false; return; }
+  const hp = camera.getWorldPosition(V()), f = camera.getWorldDirection(V()); banner.m.position.copy(hp).addScaledVector(f, 1.4); banner.m.quaternion.copy(camera.getWorldQuaternion(new THREE.Quaternion()));
+}
+// wrist display (left wrist)
+const wrist = (() => { const c = document.createElement('canvas'); c.width = 256; c.height = 128; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false, transparent: true })); s.scale.set(0.17, 0.085, 1); s.renderOrder = 5; s.visible = false; scene.add(s); return { s, c, t, last: '' }; })();
+function setWrist(l1, l2 = '', col = '#ffd23a') {
+  const key = l1 + '|' + l2 + col; if (key === wrist.last) return; wrist.last = key; const g = wrist.c.getContext('2d'); g.clearRect(0, 0, 256, 128);
+  g.fillStyle = 'rgba(12,14,16,0.8)'; g.beginPath(); g.roundRect(4, 4, 248, 120, 20); g.fill(); g.textAlign = 'center'; g.fillStyle = col; g.font = '900 46px Arial'; g.fillText(l1, 128, 58, 236); g.fillStyle = '#ddd'; g.font = '700 30px Arial'; g.fillText(l2, 128, 102, 236); wrist.t.needsUpdate = true;
+}
+// keycards
+const cardMat = new THREE.MeshStandardMaterial({ color: '#29c8ff', emissive: '#29c8ff', emissiveIntensity: 1.6 });
+const cardGeo = new THREE.BoxGeometry(0.16, 0.1, 0.012);
+function spawnKeycards(n) {
+  const spots = G7.fac.keycardSpots.slice().sort(() => Math.random() - 0.5).slice(0, n);
+  G7.keycards = spots.map(p => { const m = new THREE.Mesh(cardGeo, cardMat); m.position.copy(p); scene.add(m);
+    const glow = new THREE.PointLight('#29c8ff', 1.2, 3, 2); glow.position.copy(p); scene.add(glow); return { m, glow, base: p.clone(), got: false }; });
+}
+function clearRound() {
+  G7.monsters.forEach(m => m.dispose()); G7.monsters = []; G7.npcs.forEach(n => { if (n.state !== 'caught') n.dispose(); }); G7.npcs = [];
+  G7.keycards.forEach(k => { scene.remove(k.m); scene.remove(k.glow); }); G7.keycards = []; G7.keys = 0; G7.caught = 0;
+  if (G7.fac) { G7.fac.setAlarm(false); G7.fac.exit.setOpen(false); }
+}
+function backToLobby(msg) {
+  clearRound(); G7.mode = 'sandbox'; G7.phase = 'idle'; wrist.s.visible = false;
+  if (mode === 'monster') setMode('gorilla'); teleport(LOBBY_SPAWN, 0); if (msg) showBanner(msg[0], msg[1], msg[2], 4);
+}
+async function startMode(which) {
+  if (G7.loading) return; G7.loading = true;
+  try {
+    showBanner('LOADING...', which === 'escape' ? 'ESCAPE' : 'BE THE MONSTER', '#ffd23a', 10);
+    const fac = await ensureFacility(); const N = await ensureNPC();
+    clearRound(); G7.mode = which; G7.t = 0; G7.phase = 'intro';
+    for (const s of ['L', 'R']) if (me.armGone(s)) me.regrow(s);
+    if (which === 'escape') {
+      if (mode === 'monster') setMode('gorilla');
+      teleport(fac.spawn, fac.spawnYaw || 0); spawnKeycards(3);
+      G7.monsters = ['ripper', 'crusher', 'sawjaw'].map((k, i) => { const m = N.makeMonsterNPC(scene, k); if (m.setAudio) m.setAudio(gore.audio);
+        const sp = fac.monsterSpawns[i % fac.monsterSpawns.length]; m.pos.copy(sp); if (m.object) m.object.position.copy(sp); m.setActive(false); return m; });
+      showBanner('ESCAPE', 'Find 3 keycards, then get out. They wake up in 10 s...', '#29c8ff', 5);
+    } else {
+      setMode('monster'); teleport(fac.monsterSpawns[0], 0);
+      const spots = fac.npcSpawns.slice().sort(() => Math.random() - 0.5).slice(0, 8);
+      G7.npcs = spots.map(p => { const n = N.makeGorillaNPC(scene); n.pos.copy(p); if (n.object) n.object.position.copy(p); return n; });
+      G7.total = G7.npcs.length; G7.endT = 180;
+      showBanner('BE THE MONSTER', `Catch all ${G7.total} gorillas in 3 minutes`, '#ff3a3a', 5);
+    }
+    wrist.s.visible = true;
+  } catch (e) { console.error(e); showBanner('NOT READY YET', String(e.message || e).slice(0, 60), '#ff3a3a', 4); G7.mode = 'sandbox'; }
+  G7.loading = false;
+}
+function noiseLevel(talk = 0) { const v = hands.reduce((m, h) => Math.max(m, h.vel.length()), 0); return Math.min(1, Math.max(talk, (v - 1.5) / 4)); }
+function playerCaught(m) {
+  G7.phase = 'caught'; G7.t = 0; m.lunge(camera.getWorldPosition(V()));
+  flash.material.color.set('#b00010'); flash.material.opacity = 0.6; hands.forEach(h => pulse(h, 1, 600)); gore.sfx('tear', 1.4); gore.sfx('crunch', 1);
+}
+function updateModes(dt, t, talk = 0) {
+  updateBanner();
+  // hold B/Y on the left controller for 2 s to give up and go back to the lobby
+  if (G7.mode !== 'sandbox') { const lh = handOf('L'); const b = lh?.gamepad?.buttons?.[5]?.pressed; G7.quitHold = b ? G7.quitHold + dt : 0; if (G7.quitHold > 2) { G7.quitHold = 0; backToLobby(['BACK TO THE LOBBY', '', '#ffd23a']); return; } }
+  if (G7.mode === 'sandbox') { return; }
+  const fac = G7.fac; fac.update(dt, t); G7.t += dt;
+  const head = camera.getWorldPosition(V()); const lw = handOf('L').mesh.position; wrist.s.position.copy(lw).add(V(0, 0.13, 0));
+  if (G7.mode === 'escape') {
+    if (G7.phase === 'intro' && G7.t > 10) { G7.phase = 'play'; G7.monsters.forEach(m => m.setActive(true)); fac.setAlarm(true); setTimeout(() => { if (G7.fac && G7.keys < 3) G7.fac.setAlarm(false); }, 2500); showBanner('THEY ARE LOOSE', 'Stay quiet. Climb. Run.', '#ff3a3a', 3); hands.forEach(h => pulse(h, 0.8, 400)); }
+    // keycards: touch with a hand or your head
+    for (const k of G7.keycards) { if (k.got) continue; k.m.rotation.y += dt * 2; k.m.position.y = k.base.y + Math.sin(t * 2.5) * 0.04;
+      if ([head, ...hands.map(h => h.mesh.position)].some(p => p.distanceTo(k.m.position) < 0.35)) { k.got = true; scene.remove(k.m); scene.remove(k.glow); G7.keys++; if (fac.exit.setCards) fac.exit.setCards(G7.keys); hands.forEach(h => pulse(h, 0.6, 120)); gore.sfx('thud', 0.4);
+        if (G7.keys >= 3) { fac.exit.setOpen(true); fac.setAlarm(true); showBanner('EXIT OPEN', 'Get to the loading bay!', '#3dff7c', 4); } else showBanner(`KEYCARD ${G7.keys}/3`, '', '#29c8ff', 1.5); } }
+    const play = G7.phase === 'play' || G7.phase === 'intro';
+    for (const m of G7.monsters) { m.update(dt, t, { target: G7.phase === 'play' ? head : null, nav: fac.nav, contact, noise: noiseLevel(talk) });
+      if (G7.phase === 'play' && m.canGrab(head)) { playerCaught(m); break; } }
+    const near = Math.min(...G7.monsters.map(m => m.pos.distanceTo(head)));
+    if (G7.phase === 'play' && near < 9 && Math.random() < dt * (10 - near) * 0.5) hands.forEach(h => pulse(h, 0.15 + (9 - near) * 0.04, 30));   // heartbeat when one is close
+    setWrist(G7.keys >= 3 ? 'EXIT OPEN' : `KEYS ${G7.keys}/3`, G7.phase === 'intro' ? `wake in ${Math.max(0, 10 - G7.t).toFixed(0)}s` : `${Math.floor(G7.t)}s`, G7.keys >= 3 ? '#3dff7c' : '#29c8ff');
+    if (G7.phase === 'play' && G7.keys >= 3 && fac.exit.isOpen() && head.distanceTo(fac.exit.pos) < fac.exit.radius) { const tt = G7.t; G7.phase = 'won'; G7.t = 0; showBanner('YOU ESCAPED', `in ${Math.floor(tt)} seconds`, '#3dff7c', 5); }
+    if (G7.phase === 'caught' && G7.t > 0.45 && !G7.torn) { G7.torn = true;   // you get torn apart where you stood
+      const a = gore.makeAvatar(); a.position.set(head.x, Math.max(0, head.y - 1.3), head.z); a.rotation.y = rig.rotation.y; gore.dismember(a, V(0, 0, 1).applyAxisAngle(V(0, 1, 0), rig.rotation.y), {});
+      me.root.visible = false; showBanner('YOU WERE CAUGHT', 'Back to the lobby...', '#ff3a3a', 4); }
+    if ((G7.phase === 'caught' && G7.t > 4.5) || (G7.phase === 'won' && G7.t > 5)) { const won = G7.phase === 'won'; G7.torn = false; me.root.visible = true; backToLobby(won ? ['YOU ESCAPED', 'Escape mode cleared', '#3dff7c'] : ['CAUGHT', 'Try again at the mode wall', '#ff3a3a']); }
+  } else if (G7.mode === 'monster') {
+    if (G7.phase === 'intro' && G7.t > 3) G7.phase = 'play';
+    for (const n of G7.npcs) { if (n.state === 'caught') continue; n.update(dt, t, { threat: head, nav: fac.nav, contact, hidingSpots: fac.hidingSpots });
+      // caught by a monster hand or weapon
+      const body = n.headPos().clone().add(V(0, -0.45, 0));
+      const touch = ['L', 'R'].some(s => beastHandPos(s).distanceTo(body) < 0.6) || activeWeapons().some(w => w.headPoint.getWorldPosition(V()).distanceTo(body) < 0.6);
+      if (G7.phase === 'play' && touch) catchNPC(n);
+    }
+    const left = G7.total - G7.caught; const tl = Math.max(0, G7.endT - G7.t);
+    setWrist(`LEFT ${left}`, `${Math.floor(tl / 60)}:${String(Math.floor(tl % 60)).padStart(2, '0')}`, '#ff3a3a');
+    if (G7.phase === 'play' && left <= 0) { G7.phase = 'won'; G7.t = 0; showBanner('ALL CAUGHT', 'You are the apex specimen', '#3dff7c', 5); }
+    if (G7.phase === 'play' && tl <= 0) { G7.phase = 'lost'; G7.t = 0; showBanner('TIME UP', `${left} got away`, '#ff3a3a', 5); }
+    if ((G7.phase === 'won' || G7.phase === 'lost') && G7.t > 5) backToLobby(G7.phase === 'won' ? ['YOU WIN', 'Be the Monster cleared', '#3dff7c'] : ['THEY GOT AWAY', 'Try again at the mode wall', '#ff3a3a']);
+  }
+}
+// a caught gorilla turns into a gore gorilla you're holding: rip it, saw it, smash it
+function catchNPC(n) {
+  const pose = n.pose(); n.state = 'caught'; n.dispose(); G7.caught++;
+  const a = gore.makeAvatar(); a.position.copy(pose.position); a.rotation.y = pose.yaw; a.scale.setScalar(DUMMY_SCALE);
+  const d = { a, grow: 1, at: pose.position.clone(), respawn: 1e9 };
+  const h = ['L', 'R'].map(s => handOf(s)).sort((x, y) => beastHandPos(sideOf(x)).distanceTo(pose.position) - beastHandPos(sideOf(y)).distanceTo(pose.position))[0];
+  pickUpDummy(d, h); gore.sfx('crunch', 0.8); gore.spurt(pose.position.clone().add(V(0, 0.8, 0)), V(0, 1, 0), 20, 2.5); pulse(h, 1, 200);
+}
+// the mode wall in the lobby: three big buttons
+const MODES = [['sandbox', 'SANDBOX', '#3dff7c', 'you are here'], ['escape', 'ESCAPE', '#29c8ff', 'run from 3 monsters'], ['monster', 'BE THE MONSTER', '#ff3a3a', 'hunt the gorillas']];
+const modeBtns = MODES.map(([id, label, col, sub], i) => {
+  const x = -9.2, z = 4.8 + i * 1.6;
+  box(x, 0.5, z, 0.5, 1.0, 0.5, mat('#2a2e33', { metalness: 0.5 }));
+  const cap = add(new THREE.CylinderGeometry(0.17, 0.18, 0.07, 24), new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.6, roughness: 0.4 }), x, 1.04, z);
+  sign(label, 1.3, 0.42, x + 0.02, 1.65, z, Math.PI / 2, { fg: col, sub });
+  return { id, cap, pos: V(x, 1.08, z), armed: true };
+});
+sign('GAME MODES', 3.2, 0.7, -9.2, 2.6, 6.4, Math.PI / 2, { fg: '#ffd23a', sub: 'TOUCH A BUTTON' });
+function updateModeWall(points) {
+  if (G7.mode !== 'sandbox') return;
+  for (const B of modeBtns) { const near = points.some(p => p.distanceTo(B.pos) < 0.16 * rig.scale.x);
+    if (near && B.armed) { B.armed = false; B.cap.position.y = 1.01; hands.forEach(h => pulse(h, 0.6, 80)); if (B.id === 'sandbox') showBanner('SANDBOX', 'You are already here', '#3dff7c', 2); else startMode(B.id); }
+    if (!points.some(p => p.distanceTo(B.pos) < 0.32 * rig.scale.x)) { B.armed = true; B.cap.position.y = 1.04; } }
+}
+
+
 // ---------------- desktop test views (no headset) ----------------
 const info = document.getElementById('info');
 const fake = { head: new THREE.Object3D(), pads: [0, 1].map(() => ({ buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })) })), prev: {}, cycle: -1 };
@@ -812,6 +959,16 @@ function desktopView(t, dt, talk) {
       if (d.a && d.grow >= 1) { if (kind === 0 && d.a.userData.parts.Head) { const L = tearDummyPart(d, 'Head', null); if (L) L.vel.set((Math.random() - 0.5) * 2, 3.5, 2.5); }
         else smashDummy(d, V(Math.random() - 0.5, 0, 1), kind === 1); } }
     updateDummies(dt, t, []); return;
+  }
+  if (VIEW === 'escape' || VIEW === 'hunt') {   // start a mode and watch from above
+    if (info) info.style.display = 'none';
+    if (!fake.modeStarted && t > 1) { fake.modeStarted = true; startMode(VIEW === 'escape' ? 'escape' : 'monster'); }
+    if (G7.fac) { const o = G7.fac.spawn; const cam = new URLSearchParams(location.search).get('cam');
+      if (cam === 'top') { camera.position.set(o.x, 45, o.z + 0.01); camera.lookAt(o.x, 0, o.z); }
+      else { // stand at the spawn at eye height and look at the closest NPC (you are the target in escape)
+        camera.position.set(o.x, 1.35, o.z); const list = VIEW === 'escape' ? G7.monsters : G7.npcs.filter(n => n.state !== 'caught');
+        const c = list.map(m => m.pos).sort((a, b) => a.distanceTo(camera.position) - b.distanceTo(camera.position))[0]; if (c) camera.lookAt(c.x, 1.0, c.z); } }
+    updateModes(dt, t, 0); updateDummies(dt, t, []); return;
   }
   if (VIEW === 'slice') {   // close-up of real cuts: 1.5 s diagonal through the right forearm, 2.5 s through the head, 3.5 s diagonally through the torso, 5 s re-cut a piece on the floor
     if (info) info.style.display = 'none';
@@ -887,7 +1044,7 @@ renderer.setAnimationLoop(() => {
     updateCyberArms(dt, t, inputs, mode === 'gorilla'); updateCyberWeapons(dt);
     updateDummies(dt, t, hittersFor(inputs));
     const pts = mode === 'monster' ? ['L', 'R'].map(beastHandPos) : hands.filter(canPush).map(h => h.mesh.position);
-    updateButton(dt, t, pts); updateGoreSwitch(dt, pts);
+    updateButton(dt, t, pts); updateGoreSwitch(dt, pts); updateModeWall(pts); updateModes(dt, t, talk);
     updatePod(dt, t, camera.getWorldPosition(V()));
   } else {
     desktopView(t, dt, talk); updateButton(dt, t, []); if (VIEW !== 'pod') updatePod(dt, t, V(0, 0, 100));
@@ -897,4 +1054,4 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 document.getElementById('mic')?.addEventListener('click', async (e) => { e.target.textContent = (await voice.start()) ? 'Mic on: talk!' : 'No mic found'; });
-window.GAME = { looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };
+window.GAME = { G7, startMode, backToLobby, looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };

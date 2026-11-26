@@ -11,6 +11,7 @@
 // retracts it; hold the trigger to rev it while it is out.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 import { twoBoneIK } from './gorilla.js';
 import { makeBoneHammer, makeArmSaw } from './monster_weapons.js';
 
@@ -23,7 +24,7 @@ function setWorldQuat(bone, qWorld) { const pq = Q(); bone.parent.getWorldQuater
 
 export function makeMonster(scene) {
   const g = new THREE.Group(); scene.add(g);
-  const model = gltf.scene; g.add(model);
+  const model = SkeletonUtils.clone(gltf.scene); g.add(model);   // a fresh copy per monster, so several can exist (NPCs)
   const B = {}, eyes = [], skinned = [];
   model.traverse(o => {
     if (o.isBone) B[o.name] = o;
@@ -162,7 +163,7 @@ export function makeMonster(scene) {
     set visible(v) { if (v === headShown) return; headShown = v; B.head.scale.setScalar(v ? 1 : 0.001); eyes.forEach(e => { e.visible = v; }); B.head.updateMatrixWorld(true); skinned.forEach(m => m.skeleton.update()); },
   };
   const arms = [{ bl: { visible: false } }, { bl: { visible: false } }];
-  const out = { g, head, jaw: B.jaw, eyes, drips: [], arms, NECK: 0, B, SC, updatePlayer, handPos, setVariant, variant, weapons, setAudio: (fn) => { audioFn = fn; },
+  const out = { g, head, jaw: B.jaw, eyes, drips: [], arms, NECK: 0, B, SC, EYE, updatePlayer, handPos, setVariant, variant, weapons, setAudio: (fn) => { audioFn = fn; },
     get sawState() { return { ...SAW }; } };
   return out;
 }
