@@ -26,6 +26,7 @@ export async function initGore(scene, addSplat, contact = null) {
     const c = new THREE.Box3().setFromObject(o).getCenter(V());
     const pivot = new THREE.Group(); pivot.name = name; pivot.position.copy(c); pivot.userData.c = c.toArray(); o.name = name + '_mesh';
     gltf.scene.add(pivot); pivot.attach(o);
+    const bb = new THREE.Box3().setFromObject(pivot); pivot.userData.lb = [bb.min.clone().sub(c).toArray(), bb.max.clone().sub(c).toArray()];   // local hit box
   }
   const bodySize = new THREE.Box3().setFromObject(gltf.scene.getObjectByName('Body')).getSize(V());
   const G = { level: 'full' };
@@ -253,7 +254,22 @@ export async function initGore(scene, addSplat, contact = null) {
   const bleedingAvatars = new Set();
 
   // tear an avatar apart where it stands (it is consumed: its parts become loose pieces)
+  // smashed into little pieces (the hammer): the whole gorilla turns into chunks of fur, meat and bone
+  const furChunk = new THREE.MeshStandardMaterial({ color: '#211b18', roughness: 0.95 });
+  function pulverize(avatar, push) {
+    avatar.updateMatrixWorld(true); const at = new THREE.Box3().setFromObject(avatar).getCenter(V()); const full = G.level === 'full'; const r = () => Math.random() - 0.5;
+    scene.remove(avatar); bleedingAvatars.delete(avatar);
+    const n = full ? 34 : 16;
+    for (let i = 0; i < n; i++) { const g = new THREE.Group(); g.position.copy(at).add(V(r() * 0.5, r() * 0.7, r() * 0.4)); const kind = Math.random();
+      const m = mk(chunkGeo, kind < 0.45 ? furChunk : kind < 0.8 || !full ? meat : kind < 0.9 ? meatLight : bone, g); const sz = 0.03 + Math.random() * 0.06; m.scale.set(sz, sz * (0.6 + Math.random() * 0.5), sz * (0.7 + Math.random() * 0.6)); scene.add(g);
+      loosen(g, push.clone().multiplyScalar(2 + Math.random() * 3).add(V(r() * 5, 1.5 + Math.random() * 4, r() * 5)), V(r() * 20, r() * 20, r() * 20), Math.random() < 0.3 ? 1 : 0, Math.random() < 0.3 ? { jointLocal: V(), dirLocal: V(0, 1, 0) } : null, Math.max(0.04, sz)); }
+    if (full) for (let i = 0; i < 3; i++) gutRope(at.clone().add(V(r() * 0.3, 0, r() * 0.3)), push.clone().multiplyScalar(2).add(V(r() * 3, 2 + Math.random() * 2, r() * 3)));
+    for (let i = 0; i < 10; i++) addSplat(V(at.x + r() * 2.4 + push.x * 0.8, 0, at.z + r() * 2.4 + push.z * 0.8), V(0, 1, 0), 0.4 + Math.random() * 1.0, 0.25);
+    spurt(at, push.clone().add(V(0, 0.8, 0)), 90, 4.5); spurt(at, V(0, 1, 0), 40, 3);
+    sfx('crunch', 1.3); sfx('tear', 1.2); sfx('thud', 1);
+  }
   function dismember(avatar, push = V(0, 0, 1), opts = {}) {
+    if (opts.pulp) return pulverize(avatar, push);
     avatar.updateMatrixWorld(true); const P = avatar.userData.parts; const side = V(push.z, 0, -push.x).normalize(); const full = G.level === 'full';
     const r = () => Math.random() - 0.5;
     for (const name of ['Head', 'Arm_L', 'Arm_R']) if (P[name]) decorate(P[name], name, full);

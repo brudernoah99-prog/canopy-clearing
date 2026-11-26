@@ -9,6 +9,7 @@ import { initGore } from './gore.js';
 import { createVoice } from './talk.js';
 import { makeGorilla, twoBoneIK } from './gorilla.js';
 import { Reflector } from 'three/addons/objects/Reflector.js';
+import { makeCyberArm } from './cyber.js';
 
 // ---------------- tuning ----------------
 const T = {
@@ -327,8 +328,90 @@ const bleeding = { L: -1, R: -1 };   // seconds since that shoulder was torn ope
 const ARM_SHOULDER = { L: V(0.36, 1.04, -0.02), R: V(-0.36, 1.04, -0.02) };   // model space
 const gripOf = (h) => h.gamepad?.buttons?.[1]?.value ?? 0;
 
+// ---------------- cyber arms (chosen in the regen pod) ----------------
+const cyber = { L: null, R: null };
+const armPointsOf = (s) => cyber[s] ? cyber[s].points() : me.armPoints(s);
+function giveCyberArm(s, type) {
+  me.setCyber(s); if (cyber[s]) cyber[s].dispose();
+  const [L1, L2] = me.armLen[s]; cyber[s] = makeCyberArm(scene, type, s, L1, L2, gore.audio);
+}
+function updateCyberArms(dt, t, inputs, show) {
+  me.root.updateMatrixWorld(true); const yaw = me.root.rotation.y;
+  for (const s of ['L', 'R']) { const C = cyber[s]; if (!C) continue; C.setVisible(show); if (!show) continue; const inp = inputs[s]; if (!inp || !inp.pos) continue;
+    C.update({ shoulder: me.shoulderPos(s), yaw, target: inp.pos, quat: inp.quat, trigger: inp.gamepad?.buttons?.[0]?.value ?? 0, dt, t });
+    if (C.type === 'chainsaw' && C.rev > 0.5 && inp.h) pulse(inp.h, 0.12 + 0.2 * C.rev, 20); }
+  for (const L of limbs) if (L.cyber) L.cyber.update({ dt, t });
+}
+// chainsaw: while revving, whatever the bar touches comes off (a body gets cut in half); hammer: a hard hit turns a dummy into little pieces
+function updateCyberWeapons(dt) {
+  for (const s of ['L', 'R']) { const C = cyber[s]; if (!C || !C.attached || C.built < 1) continue; const h = handOf(s);
+    if (C.type === 'chainsaw' && C.rev > 0.5) {
+      const pts = C.cutPoints();
+      for (const d of dummies) { d.cutCd = Math.max(0, (d.cutCd || 0) - dt); if (!d.a || d.grow < 1 || d.cutCd > 0) continue;
+        for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const part = d.a.userData.parts[name]; if (!part || !part.userData.lb) continue; const c = part.getWorldPosition(V());
+          const [mn, mx] = part.userData.lb; const m = name === 'Body' ? 0.0 : 0.04;   // is any point of the bar inside this part's box?
+          const hit = pts.find(p => { const q = part.worldToLocal(p.clone()); return q.x > mn[0] - m && q.x < mx[0] + m && q.y > mn[1] - m && q.y < mx[1] + m && q.z > mn[2] - m && q.z < mx[2] + m; }); if (!hit) continue;
+          d.cutCd = 0.3; const dir = c.clone().sub(camera.getWorldPosition(V())).setY(0).normalize();
+          gore.spurt(hit, dir.clone().add(V(0, 0.7, 0)), 45, 4); gore.spurt(hit, V(0, 1, 0), 20, 2.5); C.spark(hit, 8); gore.sfx('tear', 1.1);
+          if (name === 'Body') { if (d.a.userData.parts.Head && Math.random() < 0.5) { const r = gore.tearOff(d.a, 'Head'); if (r) { const L = addLimb(r, null); L.vel.set(dir.x * 1.5, 2.5, dir.z * 1.5); } } smashDummy(d, V(dir.z, 0, -dir.x), true); }
+          else { const r = gore.tearOff(d.a, name); if (r) { d.tornT = d.tornT ?? 0; const L = addLimb(r, null); L.vel.copy(c).sub(d.at).setY(0).normalize().multiplyScalar(2).add(V(0, 2.2, 0)); L.spin.set(Math.random() * 8, Math.random() * 8, Math.random() * 8); } }
+          if (h) pulse(h, 1, 160); break; }
+      }
+    }
+    if (C.type === 'hammer') {
+      const hp = C.headPoint.getWorldPosition(V()); const sp = C.tipVel.length();
+      // check the whole path of the swing this frame (fast swings can skip past a dummy between frames)
+      const path = [0, 0.25, 0.5, 0.75, 1].map(u => hp.clone().addScaledVector(C.tipVel, -dt * u));
+      const inBox = (part, p, m) => { if (!part || !part.userData.lb) return false; const [mn, mx] = part.userData.lb; const q = part.worldToLocal(p.clone());
+        return q.x > mn[0] - m && q.x < mx[0] + m && q.y > mn[1] - m && q.y < mx[1] + m && q.z > mn[2] - m && q.z < mx[2] + m; };
+      for (const d of dummies) { if (!d.a || d.grow < 1) continue;
+        if (sp > 3.0 && Object.values(d.a.userData.parts).some(part => path.some(p => inBox(part, p, 0.1)))) { gore.dismember(d.a, C.tipVel.clone().setY(0).normalize(), { pulp: true }); d.a = null; d.respawn = 4.5; d.tornT = undefined; if (h) pulse(h, 1, 300); } }
+    }
+  }
+}
+// ---------------- the regen pod's choice: regrow with cyber? ----------------
+const choice = { side: null, grp: null, buttons: [], dwell: null, dwellT: 0, cool: 0 };
+function closeChoice() { if (choice.grp) scene.remove(choice.grp); choice.grp = null; choice.side = null; choice.buttons = []; choice.dwell = null; choice.dwellT = 0; }
+function openChoice(s) {
+  closeChoice(); choice.side = s;
+  const head = camera.getWorldPosition(V()); const f = camera.getWorldDirection(V()).setY(0); if (f.lengthSq() < 1e-4) f.set(0, 0, -1); f.normalize();
+  const g = new THREE.Group(); g.position.copy(head).addScaledVector(f, 0.55).add(V(0, -0.22, 0)); g.lookAt(head.x, g.position.y, head.z); scene.add(g); choice.grp = g;
+  const title = canvasTex(1024, 200, (c, W, H) => { c.fillStyle = 'rgba(10,14,18,0.9)'; c.fillRect(0, 0, W, H); c.strokeStyle = '#29c8ff'; c.lineWidth = 8; c.strokeRect(4, 4, W - 8, H - 8);
+    c.fillStyle = '#7fe8ff'; c.font = '900 64px Arial'; c.textAlign = 'center'; c.fillText(`REGROW YOUR ${s === 'L' ? 'LEFT' : 'RIGHT'} ARM WITH CYBER?`, W / 2, 95, W - 40);
+    c.fillStyle = '#ccc'; c.font = '600 38px Arial'; c.fillText('touch a button (or look at one)', W / 2, 160); });
+  const tm = new THREE.Mesh(new THREE.PlaneGeometry(0.75, 0.146), new THREE.MeshBasicMaterial({ map: title, transparent: true })); tm.position.y = 0.17; g.add(tm);
+  [['normal', 'NORMAL', '#3dff7c'], ['chainsaw', 'CHAINSAW', '#ff7a2a'], ['hammer', 'HAMMER', '#ffd23a']].forEach(([kind, label, col], i) => {
+    const tex = canvasTex(256, 160, (c, W, H) => { c.fillStyle = '#14181d'; c.fillRect(0, 0, W, H); c.strokeStyle = col; c.lineWidth = 12; c.strokeRect(6, 6, W - 12, H - 12); c.fillStyle = col; c.font = '900 40px Arial'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(label, W / 2, H / 2, W - 30); });
+    const b = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.14, 0.04), [dark2, dark2, dark2, dark2, new THREE.MeshBasicMaterial({ map: tex }), dark2]); b.position.set((i - 1) * 0.25, 0, 0); g.add(b);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.02, 0.028, 24), new THREE.MeshBasicMaterial({ color: col })); ring.position.set((i - 1) * 0.25, -0.1, 0.022); ring.scale.setScalar(0.001); g.add(ring);
+    choice.buttons.push({ kind, b, ring });
+  });
+  hands.forEach(h => pulse(h, 0.4, 80));
+}
+const dark2 = new THREE.MeshStandardMaterial({ color: '#2a2e33', metalness: 0.6, roughness: 0.5 });
+function pickChoice(kind) {
+  const s = choice.side; closeChoice(); choice.cool = 0.6;
+  if (kind === 'normal') { me.regrow(s); podBusy = me.GROW_TIME || 8; } else { giveCyberArm(s, kind); podBusy = 3.2; }
+  hands.forEach(h => pulse(h, 0.8, 120)); gore.sfx('thud', 0.5);
+}
+function updateChoice(dt) {
+  if (!choice.grp) return; choice.grp.updateMatrixWorld(true);
+  const head = camera.getWorldPosition(V()), look = camera.getWorldDirection(V());
+  let gazed = null;
+  for (const B of choice.buttons) { const c = B.b.getWorldPosition(V());
+    if (hands.some(h => canPush(h) && h.mesh.position.distanceTo(c) < 0.11)) { pickChoice(B.kind); return; }
+    if (look.angleTo(c.clone().sub(head)) < 0.09) gazed = B; }
+  if (gazed !== choice.dwell) { choice.dwell = gazed; choice.dwellT = 0; }
+  if (gazed) { choice.dwellT += dt; if (choice.dwellT > 2.0) { pickChoice(gazed.kind); return; } }
+  for (const B of choice.buttons) { const k = B === gazed ? choice.dwellT / 2.0 : 0; B.ring.scale.setScalar(Math.max(0.001, k * 2.2)); B.b.position.z = B === gazed ? 0.01 : 0; }
+}
 function ripArm(s, by) {
   if (!me.armOn(s)) return;
+  if (me.isCyber(s)) {   // a cyber arm comes off in one piece, with sparks (the shoulder underneath still bleeds)
+    const C = cyber[s]; cyber[s] = null; me.root.updateMatrixWorld(true); const sh = me.shoulderPos(s);
+    C.detach(); me.rip(s); bleeding[s] = 0; C.spark(sh, 30); gore.spurt(sh, V(0, 0.6, 0), 20, 2.4); gore.sfx('crunch', 1); hands.forEach(h => pulse(h, 1, 250));
+    const L = addLimb({ o: C.root, jointLocal: null, dirLocal: null }, by); L.cyber = C; return;
+  }
   me.root.updateMatrixWorld(true);
   const r = gore.makeLimb(s === 'L' ? 'Arm_L' : 'Arm_R'); const piece = r.o;
   const center = piece.position.clone(); const rq = me.root.getWorldQuaternion(new THREE.Quaternion());
@@ -344,7 +427,7 @@ function ripArm(s, by) {
 }
 function addLimb(r, by) {
   const L = { o: r.o, vel: V(), spin: V(), heldBy: null, offset: null, t: 0, jointLocal: r.jointLocal, dirLocal: r.dirLocal, rope: r.rope || null }; limbs.push(L);
-  if (limbs.length > 8) { const old = limbs.shift(); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); }
+  if (limbs.length > 8) { const old = limbs.shift(); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); if (old.cyber) old.cyber.dispose(); }
   if (by) hold(L, by);
   return L;
 }
@@ -407,7 +490,7 @@ function updateRipping(dt) {
   for (const h of hands) {
     const s = sideOf(h), o = s === 'L' ? 'R' : 'L', g = gripOf(h), was = h.gripDown;
     h.gripDown = g > 0.7 ? true : g < 0.35 ? false : h.gripDown;
-    if (mode === 'gorilla' && !me.armOn(s)) { if (h.holding) release(h); h.ripGrab = null; continue; }
+    if (mode === 'gorilla' && (!me.armOn(s) || me.isCyber(s))) { if (h.holding) release(h); h.ripGrab = null; continue; }   // no hand to grab with
     const p = mode === 'monster' ? beastHandPos(s) : h.mesh.position;
     // a held grip grabs as soon as the hand reaches a dummy part or a loose limb (not only at the moment you squeeze)
     if (h.gripDown && was && !h.ripGrab && !h.holding) {
@@ -420,7 +503,7 @@ function updateRipping(dt) {
       if (near && near.o.position.distanceTo(p) < 0.32) hold(near, h);
       else if (dp) { h.ripGrab = dp; pulse(h, 0.5, 40); }
       else if (mode === 'gorilla' && me.armOn(o)) {
-        let bi = -1, bd = 0.17; me.armPoints(o).forEach((q, i) => { const d = q.distanceTo(p); if (d < bd) { bd = d; bi = i; } });
+        let bi = -1, bd = 0.17; armPointsOf(o).forEach((q, i) => { const d = q.distanceTo(p); if (d < bd) { bd = d; bi = i; } });
         if (bi >= 0) { h.ripGrab = { o, bi, d0: bd }; pulse(h, 0.4, 40); }
       }
     }
@@ -428,7 +511,7 @@ function updateRipping(dt) {
     if (h.ripGrab && h.ripGrab.dummy) { pullDummy(h, p); continue; }
     if (h.ripGrab) {
       if (!me.armOn(h.ripGrab.o)) { h.ripGrab = null; continue; }
-      const q = me.armPoints(h.ripGrab.o)[h.ripGrab.bi]; const pull = q.distanceTo(p) - h.ripGrab.d0; const k = clamp(pull / T.ripPull, 0, 1);
+      const q = armPointsOf(h.ripGrab.o)[h.ripGrab.bi]; const pull = q.distanceTo(p) - h.ripGrab.d0; const k = clamp(pull / T.ripPull, 0, 1);
       if (k > 0.05) { pulse(h, 0.15 + 0.6 * k, 20); pulse(handOf(h.ripGrab.o), 0.15 + 0.7 * k, 20); }
       if (pull > T.ripPull) { const tgt = h.ripGrab.o; h.ripGrab = null; ripArm(tgt, h); }
     }
@@ -466,7 +549,10 @@ function updateLimbs(dt) {
 let podBusy = 0;
 function updatePod(dt, t, headPos) {
   const inPod = Math.hypot(headPos.x - POD.x, headPos.z - POD.z) < 0.9 && headPos.y < 3.2 && mode === 'gorilla';
-  if (inPod) for (const s of ['L', 'R']) if (me.armGone(s)) { me.regrow(s); podBusy = me.GROW_TIME || 8; hands.forEach(h => pulse(h, 0.3, 120)); }
+  choice.cool = Math.max(0, choice.cool - dt);
+  if (inPod && !choice.grp && choice.cool <= 0) { const s = ['L', 'R'].find(x => me.armGone(x)); if (s) openChoice(s); }
+  if (!inPod && choice.grp) closeChoice();
+  updateChoice(dt);
   podBusy = Math.max(0, podBusy - dt);
   const k = podBusy > 0 ? 1 : 0;
   podGlow.emissiveIntensity = 1.0 + 0.4 * Math.sin(t * 2) + k * (1.5 + Math.sin(t * 14));
@@ -578,13 +664,15 @@ function updateScale(dt) {
 
 // ---------------- one frame of you (works for the headset, and for the PC test views) ----------------
 function updateAvatar(head, inputs, dt, t, talk) {
-  if (mode === 'monster') updateBeast(head, inputs, dt, t, talk);
+  if (mode === 'monster') { updateBeast(head, inputs, dt, t, talk); for (const s of ['L', 'R']) if (cyber[s]) cyber[s].setVisible(false); }
   else if (me.root.visible) me.update({ camera: head, hands: inputs, talk, dt });
 }
 function hittersFor(inputs) {
   const out = [];
   if (mode === 'monster') for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos) out.push({ pos: beastHandPos(s), vel: h.vel || V(), r: 0.45, speed: T.punchSpeed * 0.8, h: h.h }); }
-  else for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos && me.armOn(s)) out.push({ pos: h.pos, vel: h.vel || V(), r: 0.38, speed: T.punchSpeed, h: h.h }); }
+  else for (const s of ['L', 'R']) { const h = inputs[s]; if (!h || !h.pos || !me.armOn(s)) continue;
+    if (cyber[s]) { const C = cyber[s]; if (C.built >= 1) out.push({ pos: C.tip.getWorldPosition(V()), vel: C.tipVel, r: 0.4, speed: 1.5, h: h.h }); }
+    else out.push({ pos: h.pos, vel: h.vel || V(), r: 0.38, speed: T.punchSpeed, h: h.h }); }
   for (const L of limbs) if (!L.heldBy || L.heldBy.gamepad) out.push({ pos: L.o.position, vel: L.vel, r: 0.45, speed: 2.0, h: L.heldBy });
   return out;
 }
@@ -593,8 +681,7 @@ function hittersFor(inputs) {
 const info = document.getElementById('info');
 const fake = { head: new THREE.Object3D(), pads: [0, 1].map(() => ({ buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })) })), prev: {}, cycle: -1 };
 scene.add(fake.head);
-function fakeInputs(t, dt) {
-  const H = V(0.6, 1.45, 7.4); fake.head.position.copy(H); fake.head.rotation.set(-0.1 * Math.sin(t * 0.7), 0.25 * Math.sin(t * 0.5), 0, 'YXZ'); fake.head.updateMatrixWorld(true);
+function fakeInputs(t, dt, H = V(0.6, 1.45, 7.4)) { fake.head.position.copy(H); fake.head.rotation.set(-0.1 * Math.sin(t * 0.7), 0.25 * Math.sin(t * 0.5), 0, 'YXZ'); fake.head.updateMatrixWorld(true);
   const inp = {};
   for (const [s, sx, i] of [['L', 1, 0], ['R', -1, 1]]) {
     const pos = H.clone().add(V(-sx * 0.38, -0.5 + 0.12 * Math.sin(t * 2 + i), -0.45));
@@ -606,6 +693,30 @@ function fakeInputs(t, dt) {
   return inp;
 }
 function desktopView(t, dt, talk) {
+  if (VIEW === 'cyber') {   // chainsaw on the left, hammer on the right, standing at the dummies; 1 s: the arms build; 5 s: rev + cut; 8 s: hammer swing
+    if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
+    if (!me.root.visible) me.root.visible = true;
+    if (!fake.cy && t > 0.8) { fake.cy = true; me.rip('L'); me.rip('R'); giveCyberArm('L', 'chainsaw'); giveCyberArm('R', 'hammer'); }
+    const X = t < 9.5 ? 3 : 6; const H = V(X, 1.25, t < 9.5 ? -4.65 : -5.0);
+    const inp = fakeInputs(t, dt, H);
+    fake.head.rotation.set(-0.3, 0, 0, 'YXZ'); fake.head.updateMatrixWorld(true);
+    // 5-8 s: the chainsaw (left) revs and sweeps through the dummy's neck and shoulder; 10.5 s: the hammer (right) comes down on the next dummy
+    const sw = Math.max(0, t - 5);
+    inp.L.pos.copy(V(X - 0.45 + 0.6 * Math.sin(sw * 1.6) ** 2, 1.32 - 0.4 * Math.min(1, Math.max(0, t - 6.5)), -5.42)); inp.L.quat.setFromEuler(new THREE.Euler(0.05, 0, Math.PI / 2, 'YXZ'));
+    inp.L.gamepad.buttons[0].value = t > 5 && t < 9 ? 1 : 0;
+    const k = sstep(10.4, 10.6, t); inp.R.pos.copy(V(X + 0.15, 1.75 - 0.75 * k, -5.4 - 0.4 * k)); inp.R.quat.setFromEuler(new THREE.Euler(0.9 - 1.9 * k, 0, 0, 'YXZ'));
+    updateAvatar(fake.head, inp, dt, t, talk);
+    for (const s of ['L', 'R']) inp[s].h = null;
+    updateCyberArms(dt, t, inp, true); updateCyberWeapons(dt);
+    updateDummies(dt, t, hittersFor(inp));
+    camera.position.set(X + 1.3, 1.75, -3.6); camera.lookAt(X - 0.1, 0.95, -5.7);
+    return;
+  }
+  if (VIEW === 'pod') {   // the choice panel in the regen pod
+    if (info) info.style.display = 'none';
+    camera.position.set(POD.x - 0.1, 1.35, POD.z + 0.1); camera.rotation.set(0, Math.PI, 0); camera.updateMatrixWorld(true);
+    if (!fake.pod) { fake.pod = true; me.rip('R'); } updatePod(dt, t, camera.getWorldPosition(V())); updateDummies(dt, t, []); return;
+  }
   if (VIEW === 'rip' || VIEW === 'monster') {
     if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
     if (VIEW === 'monster' && mode !== 'monster') setMode('monster');
@@ -677,16 +788,17 @@ renderer.setAnimationLoop(() => {
     const inputs = {}; for (const s of ['L', 'R']) { const h = handOf(s); inputs[s] = { pos: h.mesh.position, quat: h.mesh.quaternion, gamepad: h.gamepad, stuck: !!h.stuck, vel: h.vel, h }; }
     updateAvatar(camera, inputs, dt, t, talk);
     if (mode === 'gorilla') me.hideHead(true); else beast.head.visible = false;
+    updateCyberArms(dt, t, inputs, mode === 'gorilla'); if (mode === 'gorilla') updateCyberWeapons(dt);
     updateDummies(dt, t, hittersFor(inputs));
     const pts = mode === 'monster' ? ['L', 'R'].map(beastHandPos) : hands.filter(canPush).map(h => h.mesh.position);
     updateButton(dt, t, pts); updateGoreSwitch(dt, pts);
     updatePod(dt, t, camera.getWorldPosition(V()));
   } else {
-    desktopView(t, dt, talk); updateButton(dt, t, []); updatePod(dt, t, V(0, 0, 100));
+    desktopView(t, dt, talk); updateButton(dt, t, []); if (VIEW !== 'pod') updatePod(dt, t, V(0, 0, 100));
   }
   updateLimbs(dt); gore.update(dt); updateSplats(dt); updateNotice(dt);
   flash.material.opacity = Math.max(0, flash.material.opacity - dt * 0.6);
   renderer.render(scene, camera);
 });
 document.getElementById('mic')?.addEventListener('click', async (e) => { e.target.textContent = (await voice.start()) ? 'Mic on: talk!' : 'No mic found'; });
-window.GAME = { voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };
+window.GAME = { cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };

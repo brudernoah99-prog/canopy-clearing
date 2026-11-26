@@ -236,7 +236,7 @@ export function makeGorilla(scene) {
     for (const s of ['L', 'R']) {
       const A = state.arm[s];
       if (A.mode === 'grow') { A.t += dt / GROW_TIME; if (A.t >= 1) { A.t = 1; A.mode = 'on'; } }
-      const p = A.mode === 'off' ? 0 : A.mode === 'on' ? 1 : A.t;
+      const p = (A.mode === 'off' || A.mode === 'cyber') ? 0 : A.mode === 'on' ? 1 : A.t;   // a cyber arm replaces the flesh one, which stays folded away
       const g = A.mode === 'grow';
       const wob = g ? 1 + 0.03 * Math.sin(A.t * 60) * (1 - ramp(0, 0.3, p)) : 1;
       const sA = Math.max(0.02, easeOutBack(sstep(0.0, 0.14, p), 0.8) * wob), sB = Math.max(0.05, easeOutBack(sstep(0.07, 0.21, p), 0.8)), sC = Math.max(0.05, easeOutBack(sstep(0.14, 0.28, p), 1.0));
@@ -249,7 +249,7 @@ export function makeGorilla(scene) {
         const open = sstep(0.84, 1.0, p), c = 1.1 * (1 - open) - 0.25 * Math.sin(open * Math.PI);   // a loose fist that opens and stretches at the end
         fingers(s, { index: c, middle: c, ring: c, pinky: c, thumb: c * 0.7 }, 0.25 * Math.sin(open * Math.PI));
       }
-      stumps[s].visible = p < 0.12; stumps[s].scale.setScalar(1 - p / 0.12 * 0.6);
+      stumps[s].visible = p < 0.12 && A.mode !== 'cyber'; stumps[s].scale.setScalar(1 - p / 0.12 * 0.6);
     }
     layers.forEach(l => { l.visible = growing; });
     // voice: jaw + scream eyes
@@ -263,11 +263,13 @@ export function makeGorilla(scene) {
     B.head.scale.setScalar(hidden ? 0.001 : 1); headBits.forEach(m => { m.visible = !hidden; });
     B.head.updateMatrixWorld(true); skinned.forEach(m => m.skeleton.update());
   }
-  const armOn = (s) => state.arm[s].mode === 'on';
+  const armOn = (s) => state.arm[s].mode === 'on' || state.arm[s].mode === 'cyber';
+  const isCyber = (s) => state.arm[s].mode === 'cyber';
+  const setCyber = (s) => { state.arm[s].mode = 'cyber'; state.arm[s].t = 1; };
   const armGone = (s) => state.arm[s].mode === 'off';
   const rip = (s) => { state.arm[s].mode = 'off'; state.arm[s].t = 0; };
   const regrow = (s) => { if (state.arm[s].mode === 'off') { state.arm[s].mode = 'grow'; state.arm[s].t = 0; } };
   const armPoints = (s) => [`upperarm_${s}`, `forearm_${s}`, `hand_${s}`].map(wp);
   const shoulderPos = (s) => wp(`upperarm_${s}`);
-  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, armPoints, shoulderPos, state, GROW_TIME };
+  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, isCyber, setCyber, armPoints, shoulderPos, state, GROW_TIME, armLen: len };
 }
