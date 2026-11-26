@@ -34,6 +34,7 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.xr.enabled = true;
+renderer.localClippingEnabled = true;   // used to cut bodies in half
 renderer.xr.setReferenceSpaceType('local-floor');
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
@@ -290,14 +291,30 @@ const splatTex = [0, 1, 2].map(seed => { const c = document.createElement('canva
   for (let i = 0; i < 5; i++) { const a = throwA + (r() - 0.5) * 0.9, len = 50 + r() * 60; for (let s = 0; s < 1; s += 0.08) blob(128 + Math.cos(a) * len * s, 128 + Math.sin(a) * len * s, (1 - s) * 9 + 2, '#640007'); }
   for (let i = 0; i < 40; i++) { const a = r() * 6.28, d = 55 + r() * 70; blob(128 + Math.cos(a) * d, 128 + Math.sin(a) * d, Math.max(1.5, 9 - d / 16) * (0.5 + r()), '#600006'); }
   blob(118, 118, 20, 'rgba(150,20,30,0.45)');
+  // darker, drying edges and a wet centre
+  g.globalCompositeOperation = 'source-atop'; const rg = g.createRadialGradient(128, 128, 20, 128, 128, 128); rg.addColorStop(0, 'rgba(170,20,30,0.25)'); rg.addColorStop(0.55, 'rgba(0,0,0,0)'); rg.addColorStop(1, 'rgba(25,0,2,0.6)'); g.fillStyle = rg; g.fillRect(0, 0, 256, 256);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t; });
 const splats = [];
-function addSplat(pos, normal, size) {
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshStandardMaterial({ map: splatTex[splats.length % 3], transparent: true, roughness: 0.25, metalness: 0.1, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }));
-  m.position.copy(pos).addScaledVector(normal, 0.01); m.lookAt(pos.clone().add(normal)); m.rotateZ(Math.random() * 6.28); scene.add(m); splats.push(m);
-  if (splats.length > 60) scene.remove(splats.shift());
+const splatGeo = new THREE.PlaneGeometry(1, 1);
+const splatMats = splatTex.map(map => new THREE.MeshStandardMaterial({ map, transparent: true, roughness: 0.14, metalness: 0.2, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }));
+// a splat or pool that spreads out over `grow` seconds, stays ~45 s, then shrinks away
+function addSplat(pos, normal, size, grow = 0.3) {
+  const m = new THREE.Mesh(splatGeo, splatMats[(Math.random() * 3) | 0]);
+  m.position.copy(pos).addScaledVector(normal, 0.006 + splats.length * 0.00002); m.lookAt(pos.clone().add(normal)); m.rotateZ(Math.random() * 6.28);
+  m.userData = { size, grow, t: 0, life: 40 + Math.random() * 10 }; m.scale.setScalar(size * 0.2); scene.add(m); splats.push(m);
+  if (splats.length > 90) scene.remove(splats.shift());
 }
-const gore = await initGore(scene, addSplat);
+function updateSplats(dt) {
+  for (let i = splats.length - 1; i >= 0; i--) {
+    const m = splats[i], u = m.userData; u.t += dt;
+    const k = u.grow > 0 ? Math.min(1, u.t / u.grow) : 1; let sc = u.size * (0.2 + 0.8 * (1 - Math.pow(1 - k, 3)));
+    if (u.t > u.life) { sc *= Math.max(0, 1 - (u.t - u.life) / 4); if (sc <= 0.001) { scene.remove(m); splats.splice(i, 1); continue; } }
+    m.scale.setScalar(sc);
+  }
+}
+const gore = await initGore(scene, addSplat, contact);
+// gore level: FULL (default, 17+) or LOW; remembered on this device, ?gore=low forces it
+try { gore.G.level = new URLSearchParams(location.search).get('gore') || localStorage.getItem('goreLevel') || 'full'; } catch (e) {}
 const voice = createVoice(); if (/faketalk/.test(location.search)) voice.setFake(true);
 
 // ---------------- you: the gorilla ----------------
@@ -305,7 +322,7 @@ const me = makeGorilla(scene); me.root.visible = false;
 const VIEW = new URLSearchParams(location.search).get('view');   // desktop test views: rip, monster, dummies
 
 // ---------------- ripping your own arm off, and the arms lying around ----------------
-const limbs = [];   // { o, vel, spin, heldBy, offset, t, stumpLocal }
+const limbs = [];   // { o, vel, spin, heldBy, offset, t, jointLocal, dirLocal }: arms and heads you can hold and throw
 const bleeding = { L: -1, R: -1 };   // seconds since that shoulder was torn open (-1 = not bleeding)
 const ARM_SHOULDER = { L: V(0.36, 1.04, -0.02), R: V(-0.36, 1.04, -0.02) };   // model space
 const gripOf = (h) => h.gamepad?.buttons?.[1]?.value ?? 0;
@@ -313,20 +330,34 @@ const gripOf = (h) => h.gamepad?.buttons?.[1]?.value ?? 0;
 function ripArm(s, by) {
   if (!me.armOn(s)) return;
   me.root.updateMatrixWorld(true);
-  const piece = gore.makePart(s === 'L' ? 'Arm_L' : 'Arm_R');
+  const r = gore.makeLimb(s === 'L' ? 'Arm_L' : 'Arm_R'); const piece = r.o;
   const center = piece.position.clone(); const rq = me.root.getWorldQuaternion(new THREE.Quaternion());
   piece.position.copy(me.root.localToWorld(center.clone())); piece.quaternion.copy(rq); scene.add(piece);
-  const stumpLocal = ARM_SHOULDER[s].clone().sub(center).normalize();
   const sh = me.shoulderPos(s);
   me.rip(s); bleeding[s] = 0;
-  const L = { o: piece, vel: V(), spin: V(), heldBy: null, offset: null, t: 0, stumpLocal }; limbs.push(L);
-  if (limbs.length > 6) { const old = limbs.shift(); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); }
   // a big tearing burst
   const out = sh.clone().sub(camera.getWorldPosition(V())).setY(0).normalize();
-  gore.spurt(sh, out.clone().add(V(0, 0.6, 0)), 45, 3.2);
+  gore.spurt(sh, out.clone().add(V(0, 0.6, 0)), 45, 3.2); gore.sfx('tear', 1.2);
   addSplat(V(sh.x, 0, sh.z), V(0, 1, 0), 0.9);
   hands.forEach(h => pulse(h, 1, 250));
+  addLimb(r, by);
+}
+function addLimb(r, by) {
+  const L = { o: r.o, vel: V(), spin: V(), heldBy: null, offset: null, t: 0, jointLocal: r.jointLocal, dirLocal: r.dirLocal }; limbs.push(L);
+  if (limbs.length > 8) { const old = limbs.shift(); if (old.heldBy) old.heldBy.holding = null; scene.remove(old.o); }
   if (by) hold(L, by);
+  return L;
+}
+// grabbing a test dummy's head or arm
+function dummyPartNear(p) {
+  let best = null, bd = Infinity;
+  for (const d of dummies) { if (!d.a || d.grow < 1) continue;
+    for (const name of ['Head', 'Arm_L', 'Arm_R']) { const part = d.a.userData.parts[name]; if (!part) continue; const dist = part.getWorldPosition(V()).distanceTo(p);
+      if (dist < (name === 'Head' ? 0.2 : 0.24) && dist < bd) { bd = dist; best = { dummy: d, part: name, d0: dist }; } } }
+  return best;
+}
+function tearDummyPart(d, name, h) {
+  const r = gore.tearOff(d.a, name); if (!r) return null; d.tornT = d.tornT ?? 0; hands.forEach(x => pulse(x, x === h ? 1 : 0.4, 220)); return addLimb(r, h);
 }
 function hold(L, h) {
   if (L.heldBy) L.heldBy.holding = null;
@@ -341,21 +372,29 @@ function release(h) {
   L.vel.copy(h.vel).multiplyScalar(1.15); L.spin.set((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 10).multiplyScalar(Math.min(1, h.vel.length() / 3));
 }
 function updateRipping(dt) {
-  if (mode !== 'gorilla') return;
   for (const h of hands) {
     const s = sideOf(h), o = s === 'L' ? 'R' : 'L', g = gripOf(h), was = h.gripDown;
     h.gripDown = g > 0.7 ? true : g < 0.35 ? false : h.gripDown;
-    if (!me.armOn(s)) { if (h.holding) release(h); h.ripGrab = null; continue; }
+    if (mode === 'gorilla' && !me.armOn(s)) { if (h.holding) release(h); h.ripGrab = null; continue; }
     const p = h.mesh.position;
     if (h.gripDown && !was) {
       const near = limbs.filter(L => !L.heldBy).sort((a, b) => a.o.position.distanceTo(p) - b.o.position.distanceTo(p))[0];
+      const dp = dummyPartNear(p);
       if (near && near.o.position.distanceTo(p) < 0.32) hold(near, h);
-      else if (me.armOn(o)) {
+      else if (dp) { h.ripGrab = dp; pulse(h, 0.5, 40); }
+      else if (mode === 'gorilla' && me.armOn(o)) {
         let bi = -1, bd = 0.17; me.armPoints(o).forEach((q, i) => { const d = q.distanceTo(p); if (d < bd) { bd = d; bi = i; } });
         if (bi >= 0) { h.ripGrab = { o, bi, d0: bd }; pulse(h, 0.4, 40); }
       }
     }
     if (!h.gripDown) { if (h.holding) release(h); h.ripGrab = null; }
+    if (h.ripGrab && h.ripGrab.dummy) {   // pulling a dummy's head or arm off
+      const G = h.ripGrab, part = G.dummy.a?.userData.parts[G.part]; if (!part) { h.ripGrab = null; continue; }
+      const pull = part.getWorldPosition(V()).distanceTo(p) - G.d0; const k = clamp(pull / 0.22, 0, 1);
+      if (k > 0.05) pulse(h, 0.2 + 0.7 * k, 20);
+      if (pull > 0.22) { h.ripGrab = null; tearDummyPart(G.dummy, G.part, h); }
+      continue;
+    }
     if (h.ripGrab) {
       if (!me.armOn(h.ripGrab.o)) { h.ripGrab = null; continue; }
       const q = me.armPoints(h.ripGrab.o)[h.ripGrab.bi]; const pull = q.distanceTo(p) - h.ripGrab.d0; const k = clamp(pull / T.ripPull, 0, 1);
@@ -375,14 +414,18 @@ function updateLimbs(dt) {
       const c = contact(o.position, 0.11);
       if (c.dist < 0.11) { o.position.copy(c.rest); const vn = L.vel.dot(c.normal); if (vn < 0) { if (vn < -2) addSplat(c.point, c.normal, 0.35 + Math.random() * 0.3); L.vel.addScaledVector(c.normal, -1.3 * vn); } L.vel.multiplyScalar(0.72); L.spin.multiplyScalar(0.6); }
     }
-    // the torn end keeps bleeding for a while
-    if (L.t < 5 && Math.random() < (L.t < 1.5 ? 0.6 : 0.2)) { const d = L.stumpLocal.clone().applyQuaternion(o.quaternion); gore.spurt(o.position.clone().addScaledVector(d, 0.38), d, 1, 1.6 * (1 - L.t / 5) + 0.3); }
+    // the torn end spurts in pulses, then drips
+    if (L.jointLocal && L.t < 7) { const w = o.localToWorld(L.jointLocal.clone()); const d = L.dirLocal.clone().applyQuaternion(o.quaternion);
+      const k = Math.pow(Math.max(0, Math.sin(L.t * Math.PI * 3)), 3) * Math.max(0.15, 1 - L.t / 6);
+      if (k > 0.3 && Math.random() < 0.8) { gore.spurt(w, d, 2, 0.8 + 2.4 * k); if (L.heldBy && k > 0.9) pulse(L.heldBy, 0.25, 15); }
+      else if (Math.random() < dt * 4) gore.spurt(w, V(0, -1, 0), 1, 0.2); }
   }
   // open shoulders bleed too, until the arm grows back
   for (const s of ['L', 'R']) {
     if (bleeding[s] < 0) continue; if (!me.armGone(s)) { bleeding[s] = -1; continue; }
     bleeding[s] += dt; const b = bleeding[s];
-    if (me.root.visible && Math.random() < (b < 2 ? 0.7 : 0.12)) { const sh = me.shoulderPos(s); const out = sh.clone().sub(me.root.getWorldPosition(V())).setY(0).normalize(); gore.spurt(sh, out.add(V(0, 0.4, 0)), 1, b < 2 ? 2.4 : 0.6); }
+    const kb = Math.pow(Math.max(0, Math.sin(b * Math.PI * 3)), 3) * Math.max(0.2, 1 - b / 6);
+    if (me.root.visible && kb > 0.3 && Math.random() < 0.8) { const sh = me.shoulderPos(s); const out = sh.clone().sub(me.root.getWorldPosition(V())).setY(0).normalize(); gore.spurt(sh, out.add(V(0, 0.4, 0)), 2, 0.6 + 2.2 * kb); if (kb > 0.9) pulse(handOf(s === 'L' ? 'R' : 'L'), 0.15, 15); }
   }
 }
 
@@ -408,19 +451,20 @@ function updatePod(dt, t, headPos) {
 const dummies = DUMMY_SPOTS.map(at => ({ at, a: null, grow: 1, respawn: 0 }));
 function spawnDummy(d) { d.a = gore.makeAvatar(); d.a.position.copy(d.at); d.a.scale.setScalar(0.01); d.grow = 0; }
 dummies.forEach(spawnDummy);
-function smashDummy(d, push) {
+function smashDummy(d, push, split = false) {
   if (!d.a) return; d.a.scale.setScalar(1); d.a.updateMatrixWorld(true);
-  gore.dismember(d.a, push.clone().setY(0).normalize()); d.a = null; d.respawn = 4.5;
+  gore.dismember(d.a, push.clone().setY(0).normalize(), { split }); d.a = null; d.respawn = 4.5; d.tornT = undefined;
 }
 function updateDummies(dt, t, hitters) {
   dummies.forEach((d, i) => {
     if (!d.a) { d.respawn -= dt; if (d.respawn <= 0) spawnDummy(d); return; }
     if (d.grow < 1) { d.grow = Math.min(1, d.grow + dt / 0.9); d.a.scale.setScalar(Math.max(0.01, easeOutBack(d.grow, 1.6))); }
+    if (d.tornT !== undefined) { d.tornT += dt; if (d.tornT > 12) { smashDummy(d, V(0, 0, 1)); return; } }   // a half-torn dummy collapses after a while
     d.a.rotation.y = Math.sin(t * 0.8 + i) * 0.06;
     const c = d.at.clone().add(V(0, 0.75, 0));
     for (const hit of hitters) {
       const dx = hit.pos.x - c.x, dz = hit.pos.z - c.z, dy = hit.pos.y - c.y;
-      if (Math.hypot(dx, dz) < hit.r && Math.abs(dy) < 0.75 && hit.vel.length() > hit.speed) { smashDummy(d, hit.vel.lengthSq() > 0.01 ? hit.vel : V(0, 0, -1)); if (hit.h) pulse(hit.h, 1, 120); break; }
+      if (Math.hypot(dx, dz) < hit.r && Math.abs(dy) < 0.75 && hit.vel.length() > hit.speed) { smashDummy(d, hit.vel.lengthSq() > 0.01 ? hit.vel : V(0, 0, -1), !!hit.split); if (hit.h) pulse(hit.h, 1, 120); break; }
     }
   });
 }
@@ -473,6 +517,33 @@ function updateButton(dt, t, points) {
   btnPress = Math.max(0, btnPress - dt * 3); btnCap.position.y = 1.05 - 0.035 * btnPress;
   btnCap.material.emissiveIntensity = 0.6 + 0.4 * Math.sin(t * 4) + btnPress * 2; btnLight.intensity = 1 + 0.5 * Math.sin(t * 4);
 }
+// ---------------- gore switch (by the mirror) + the 17+ notice ----------------
+const GSW = V(-2.5, 1.0, 6.6);
+box(GSW.x, 0.48, GSW.z, 0.4, 0.96, 0.4, darkMetal);
+const gswCap = add(new THREE.CylinderGeometry(0.12, 0.13, 0.06, 20), new THREE.MeshStandardMaterial({ color: '#2a7bff', emissive: '#0a3a9a', emissiveIntensity: 0.8, roughness: 0.35 }), GSW.x, 1.0, GSW.z);
+let gswSign = null;
+function drawGoreSign() { if (gswSign) scene.remove(gswSign); const full = gore.G.level === 'full';
+  gswSign = sign(full ? 'GORE: FULL' : 'GORE: LOW', 1.0, 0.36, GSW.x, 1.5, GSW.z, Math.atan2(-GSW.x, 8 - GSW.z), { fg: full ? '#ff4040' : '#5aa8ff', sub: 'PRESS TO CHANGE' }); }
+drawGoreSign();
+let gswArmed = true, gswPress = 0;
+function updateGoreSwitch(dt, points) {
+  const top = V(GSW.x, 1.04, GSW.z); const near = points.some(p => p.distanceTo(top) < 0.13 * rig.scale.x);
+  if (near && gswArmed) { gswArmed = false; gswPress = 1; gore.G.level = gore.G.level === 'full' ? 'low' : 'full'; try { localStorage.setItem('goreLevel', gore.G.level); } catch (e) {} drawGoreSign(); hands.forEach(h => pulse(h, 0.5, 60)); }
+  if (!points.some(p => p.distanceTo(top) < 0.28 * rig.scale.x)) gswArmed = true;
+  gswPress = Math.max(0, gswPress - dt * 3); gswCap.position.y = 1.0 - 0.03 * gswPress;
+}
+// a notice that floats in front of you for a few seconds when the game starts
+const notice = (() => { const t = canvasTex(1024, 512, (g, W, H) => { g.fillStyle = 'rgba(12,12,14,0.92)'; g.fillRect(0, 0, W, H); g.strokeStyle = '#d4101c'; g.lineWidth = 14; g.strokeRect(10, 10, W - 20, H - 20);
+    g.fillStyle = '#ff3a3a'; g.font = '900 120px Arial'; g.textAlign = 'center'; g.fillText('17+', W / 2, 150); g.fillStyle = '#fff'; g.font = '900 54px Arial'; g.fillText('MATURE CONTENT', W / 2, 235);
+    g.font = '600 38px Arial'; g.fillStyle = '#ddd'; g.fillText('Blood, gore and dismemberment.', W / 2, 315); g.fillText('Turn it down at the blue GORE switch', W / 2, 375); g.fillText('next to the mirror.', W / 2, 425); });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.6), new THREE.MeshBasicMaterial({ map: t, transparent: true, opacity: 0, depthTest: false })); m.renderOrder = 30; m.visible = false; scene.add(m); return m; })();
+let noticeT = -1;
+function updateNotice(dt) {
+  if (noticeT < 0) return; noticeT += dt;
+  const o = noticeT < 0.5 ? noticeT / 0.5 : noticeT > 7 ? Math.max(0, 1 - (noticeT - 7) / 0.8) : 1; notice.material.opacity = o; notice.visible = o > 0;
+  const hp = camera.getWorldPosition(V()), f = camera.getWorldDirection(V()).setY(0).normalize(); notice.position.copy(hp).addScaledVector(f, 1.3).add(V(0, -0.05, 0)); notice.lookAt(hp.x, notice.position.y, hp.z);
+  if (noticeT > 8) { noticeT = -1; notice.visible = false; }
+}
 // rig size: smoothly grow when you're the monster, keeping your head where it is
 function updateScale(dt) {
   const target = mode === 'monster' ? T.monsterScale : 1; const s = rig.scale.x; if (Math.abs(s - target) < 1e-3) return;
@@ -491,7 +562,7 @@ function updateAvatar(head, inputs, dt, t, talk) {
 }
 function hittersFor(inputs) {
   const out = [];
-  if (mode === 'monster') for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos) out.push({ pos: beastHandPos(s), vel: h.vel || V(), r: 0.55, speed: 0.5, h: h.h }); }
+  if (mode === 'monster') for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos) out.push({ pos: beastHandPos(s), vel: h.vel || V(), r: 0.55, speed: 0.5, h: h.h, split: true }); }
   else for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos && me.armOn(s)) out.push({ pos: h.pos, vel: h.vel || V(), r: 0.4, speed: T.punchSpeed, h: h.h }); }
   for (const L of limbs) out.push({ pos: L.o.position, vel: L.vel, r: 0.5, speed: 2.0, h: L.heldBy });
   return out;
@@ -534,9 +605,22 @@ function desktopView(t, dt, talk) {
     if (VIEW === 'monster') { camera.position.set(0.6, 2.0, 4.2); camera.lookAt(0.6, 1.3, 7.4); }
     return;
   }
-  if (VIEW === 'dummies') {   // knock a random dummy over every second
+  if (VIEW === 'dummies') {   // every second: rip a head off, split one in half, or smash one
+    if (info) info.style.display = 'none';
     camera.position.set(0, 1.8, -1.5); camera.lookAt(0, 0.9, -6);
-    if (Math.floor(t) !== fake.cycle) { fake.cycle = Math.floor(t); const d = dummies[fake.cycle % 5]; if (d.a && d.grow >= 1) smashDummy(d, V(Math.random() - 0.5, 0, -1)); }
+    if (Math.floor(t) !== fake.cycle && t > 1.5) { fake.cycle = Math.floor(t); const d = dummies[fake.cycle % 5]; const kind = fake.cycle % 3;
+      if (d.a && d.grow >= 1) { if (kind === 0 && d.a.userData.parts.Head) { const L = tearDummyPart(d, 'Head', null); if (L) L.vel.set((Math.random() - 0.5) * 2, 3.5, 2.5); }
+        else smashDummy(d, V(Math.random() - 0.5, 0, 1), kind === 1); } }
+    updateDummies(dt, t, []); return;
+  }
+  if (VIEW === 'head' || VIEW === 'split') {   // close-ups: a torn-off head held up, or a dummy cut in half
+    if (info) info.style.display = 'none';
+    const d = dummies[2];
+    if (!fake.done && d.a && d.grow >= 1 && t > 1.2) { fake.done = true;
+      if (VIEW === 'head') { const fh = { mesh: new THREE.Object3D(), vel: V(), holding: null }; fake.fh = fh; fh.mesh.position.set(0, 1.6, -5.2); const L = tearDummyPart(d, 'Head', fh); L.offset = new THREE.Matrix4(); }
+      else { smashDummy(d, V(0, 0, 0.25), true); } }
+    if (fake.fh) { fake.fh.mesh.position.set(0, 1.55, -4.9); fake.fh.mesh.rotation.set(0.15, t * 0.6, 0); }
+    if (VIEW === 'head') { camera.position.set(0.15, 1.45, -4.0); camera.lookAt(0, 1.35, -4.9); } else { camera.position.set(0.9, 1.6, -3.2); camera.lookAt(0, 0.3, -5.6); }
     updateDummies(dt, t, []); return;
   }
   if (VIEW === 'spawn') { if (info) info.style.display = 'none'; const yaw = +(new URLSearchParams(location.search).get('yaw') || 0); camera.position.set(0, 1.4, 8); camera.rotation.set(-0.08, yaw, 0, 'YXZ'); updateDummies(dt, t, []); return; }
@@ -545,7 +629,7 @@ function desktopView(t, dt, talk) {
   updateDummies(dt, t, []);
 }
 
-renderer.xr.addEventListener('sessionstart', () => { camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); rig.position.set(0, 0, 8); vel.set(0, 0, 0); voice.start(); me.root.visible = mode === 'gorilla'; if (info) info.style.display = 'none'; });
+renderer.xr.addEventListener('sessionstart', () => { camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); rig.position.set(0, 0, 8); vel.set(0, 0, 0); voice.start(); gore.audio(); me.root.visible = mode === 'gorilla'; if (info) info.style.display = 'none'; if (gore.G.level === 'full') noticeT = 0; });
 renderer.xr.addEventListener('sessionend', () => { if (info) info.style.display = ''; });
 
 const clock = new THREE.Clock();
@@ -559,12 +643,12 @@ renderer.setAnimationLoop(() => {
     if (mode === 'gorilla') me.hideHead(true); else beast.head.visible = false;
     updateDummies(dt, t, hittersFor(inputs));
     const pts = mode === 'monster' ? ['L', 'R'].map(beastHandPos) : hands.filter(canPush).map(h => h.mesh.position);
-    updateButton(dt, t, pts);
+    updateButton(dt, t, pts); updateGoreSwitch(dt, pts);
     updatePod(dt, t, camera.getWorldPosition(V()));
   } else {
     desktopView(t, dt, talk); updateButton(dt, t, []); updatePod(dt, t, V(0, 0, 100));
   }
-  updateLimbs(dt); gore.update(dt);
+  updateLimbs(dt); gore.update(dt); updateSplats(dt); updateNotice(dt);
   flash.material.opacity = Math.max(0, flash.material.opacity - dt * 0.6);
   renderer.render(scene, camera);
 });
