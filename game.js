@@ -367,14 +367,14 @@ function updateCyberWeapons(dt) {
           if (r) { hitAt = hit; if (name === 'Body') { d.a = null; if (d.loose) unpinLoose(d); else { d.respawn = 4.5; d.tornT = undefined; } } else d.tornT = d.tornT ?? 0; }
           break; }
         if (hitAt) break; }
-      if (!hitAt) for (const P of gore.pieces.slice()) { const o = P.o; if (!o.userData.lb || (o.userData.size ?? 1) < 0.14) continue;
+      if (!hitAt) for (const P of gore.pieces.slice()) { const o = P.o; if (!o.userData.lb || (o.userData.size ?? 1) < 0.22 || P.t < 0.5) continue;
         const hit = pts.find(p => inBoxObj(o, p, 0.02)); if (!hit) continue;
         if (gore.cutLoose(o, new THREE.Plane().setFromNormalAndCoplanarPoint(nrm, hit))) { hitAt = hit; break; } }
       if (!hitAt) for (const L of limbs.slice()) { if (L.cyber || L.dummy || !L.o.userData.lb) continue; const o = L.o;
         const hit = pts.find(p => inBoxObj(o, p, 0.02)); if (!hit) continue;
         if (L.heldBy) L.heldBy.holding = null; limbs.splice(limbs.indexOf(L), 1);
         if (gore.cutLoose(o, new THREE.Plane().setFromNormalAndCoplanarPoint(nrm, hit), L.vel)) { hitAt = hit; break; } }
-      if (hitAt) { C.cutCd = 0.12; gore.spurt(hitAt, nrm.clone().add(V(0, 0.6, 0)), 35, 3.5); gore.spurt(hitAt, nrm.clone().negate().add(V(0, 0.6, 0)), 20, 3); C.spark(hitAt, 6); gore.sfx('tear', 1.1); if (h) pulse(h, 1, 140); }
+      if (hitAt) { C.cutCd = 0.3; gore.spurt(hitAt, nrm.clone().add(V(0, 0.6, 0)), 35, 3.5); gore.spurt(hitAt, nrm.clone().negate().add(V(0, 0.6, 0)), 20, 3); C.spark(hitAt, 6); gore.sfx('tear', 1.1); if (h) pulse(h, 1, 140); }
     }
     if (C.type === 'hammer') {
       const hp = C.headPoint.getWorldPosition(V()); const sp = C.tipVel.length();
@@ -462,10 +462,11 @@ function pickUpDummy(d, h) {
   const body = a.userData.parts.Body; const c = body ? body.getWorldPosition(V()) : a.getWorldPosition(V()).add(V(0, 0.65, 0));
   const pivot = new THREE.Group(); pivot.position.copy(c); scene.add(pivot); pivot.attach(a);
   const entry = { a, grow: 1, at: c.clone(), loose: true, limb: null, tornT: d.tornT };
-  const L = addLimb({ o: pivot, jointLocal: null, dirLocal: null }, null); L.radius = 0.28; L.dummy = entry; entry.limb = L; hold(L, h);
+  const L = addLimb({ o: pivot, jointLocal: null, dirLocal: null }, null); L.radius = 0.28; L.dummy = entry; entry.limb = L; if (h) hold(L, h);
   looseDummies.push(entry);
   d.a = null; d.respawn = 3; d.tornT = undefined;   // a fresh one appears on the stand
-  gore.sfx('thud', 0.4); pulse(h, 0.6, 80);
+  gore.sfx('thud', 0.4); if (h) pulse(h, 0.6, 80);
+  return L;
 }
 function unpinLoose(d) {   // take a loose dummy out of its pivot (before it gets torn apart)
   const L = d.limb; if (L) { if (L.heldBy) L.heldBy.holding = null; const i = limbs.indexOf(L); if (i >= 0) limbs.splice(i, 1); }
@@ -480,7 +481,7 @@ function updateLooseDummies(dt, hitters) {
     // punches / tools knock it around
     const c = d.at.clone().add(V(0, 0.75 * DUMMY_SCALE, 0));
     if (!d.limb.heldBy) for (const hit of hitters) { if (hit.h && hit.h === d.limb.heldBy) continue; const sp = hit.vel.length();
-      if (hit.pos.distanceTo(c) < 0.4 && sp > hit.speed) { d.limb.vel.addScaledVector(hit.vel, 0.6).add(V(0, 1, 0)); d.limb.spin.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+      if (hit.pos.distanceTo(c) < 0.4 && sp > hit.speed) { d.limb.vel.addScaledVector(hit.vel.clone().clampLength(0, 4), 0.25).add(V(0, 0.6, 0)); d.limb.spin.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
         gore.spurt(hit.pos.clone(), hit.vel.clone().normalize(), 8, 1 + sp * 0.3); gore.sfx('thud', Math.min(1, sp / 6)); if (hit.h && hit.h.gamepad) pulse(hit.h, 0.6, 60); break; } }
   }
 }
@@ -870,7 +871,10 @@ function catchNPC(n) {
   const a = gore.makeAvatar(); a.position.copy(pose.position); a.rotation.y = pose.yaw; a.scale.setScalar(DUMMY_SCALE);
   const d = { a, grow: 1, at: pose.position.clone(), respawn: 1e9 };
   const h = ['L', 'R'].map(s => handOf(s)).sort((x, y) => beastHandPos(sideOf(x)).distanceTo(pose.position) - beastHandPos(sideOf(y)).distanceTo(pose.position))[0];
-  pickUpDummy(d, h); gore.sfx('crunch', 0.8); gore.spurt(pose.position.clone().add(V(0, 0.8, 0)), V(0, 1, 0), 20, 2.5); pulse(h, 1, 200);
+  const L = pickUpDummy(d, null); const hv = h.vel.clone().setY(0); if (hv.length() > 3) hv.setLength(3);
+  if (L) { L.vel.copy(hv).multiplyScalar(0.5).add(V(0, 1.2, 0)); L.spin.set(Math.random() * 3, Math.random() * 3, Math.random() * 3); }   // knocked over, stays nearby
+  gore.sfx('crunch', 0.8); gore.spurt(pose.position.clone().add(V(0, 0.8, 0)), V(0, 1, 0), 20, 2.5); pulse(h, 1, 200);
+  showBanner('CAUGHT!', 'Grab it with GRIP to rip it apart', '#ff3a3a', 1.6);
 }
 // the mode wall in the lobby: three big buttons
 const MODES = [['sandbox', 'SANDBOX', '#3dff7c', 'you are here'], ['escape', 'ESCAPE', '#29c8ff', 'run from 3 monsters'], ['monster', 'BE THE MONSTER', '#ff3a3a', 'hunt the gorillas']];
@@ -1054,4 +1058,4 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 document.getElementById('mic')?.addEventListener('click', async (e) => { e.target.textContent = (await voice.start()) ? 'Mic on: talk!' : 'No mic found'; });
-window.GAME = { G7, startMode, backToLobby, looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };
+window.GAME = { catchNPC, G7, startMode, backToLobby, looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };

@@ -78,7 +78,7 @@ export function makeMonster(scene) {
   }
   function sawSound(on, rev) {
     if (!audioFn) return; if (!snd) { const a = audioFn(); if (!a) return; const o = a.createOscillator(); o.type = 'sawtooth'; const f = a.createBiquadFilter(); f.type = 'lowpass'; const gn = a.createGain(); gn.gain.value = 0; o.connect(f); f.connect(gn); gn.connect(a.destination); o.start(); snd = { a, o, f, g: gn }; }
-    const now = snd.a.currentTime; snd.o.frequency.setTargetAtTime(50 + 130 * rev, now, 0.05); snd.f.frequency.setTargetAtTime(450 + 1500 * rev, now, 0.05); snd.g.gain.setTargetAtTime(on && g.visible ? 0.03 + 0.1 * rev : 0, now, 0.08);
+    const now = snd.a.currentTime; snd.o.frequency.setTargetAtTime(50 + 130 * rev, now, 0.05); snd.f.frequency.setTargetAtTime(450 + 1500 * rev, now, 0.05); snd.g.gain.setTargetAtTime(on && g.visible ? 0.008 + 0.08 * rev : 0, now, 0.08);
   }
   // place a weapon (a child of g, so it hides with the monster) at a world position/rotation
   const _gq = Q(), _gi = new THREE.Matrix4();

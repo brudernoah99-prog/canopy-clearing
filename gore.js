@@ -175,8 +175,14 @@ export async function initGore(scene, addSplat, contact = null) {
   // ---------- sound (synthesized, no files) ----------
   let ac = null, noiseBuf = null;
   const audio = () => { if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); const n = ac.sampleRate; noiseBuf = ac.createBuffer(1, n, n); const d = noiseBuf.getChannelData(0); for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1; } catch (e) { ac = null; } } if (ac && ac.state === 'suspended') ac.resume(); return ac; };
+  // all gore sounds go through one limiter (no clipping/crackle), each type can't repeat too fast, and only a few play at once
+  let master = null; const lastAt = {}; let voices = 0;
+  const GAP = { tear: 0.22, crunch: 0.25, squelch: 0.1, thud: 0.1 };
   function sfx(type, k = 1) {
-    const a = audio(); if (!a) return; const t = a.currentTime; const out = a.createGain(); out.connect(a.destination);
+    const a = audio(); if (!a) return; const t = a.currentTime;
+    if (t - (lastAt[type] ?? -9) < (GAP[type] ?? 0.1) || voices >= 6) return; lastAt[type] = t; voices++; setTimeout(() => { voices--; }, 600);
+    if (!master) { const comp = a.createDynamicsCompressor(); comp.threshold.value = -18; comp.ratio.value = 8; comp.attack.value = 0.003; comp.release.value = 0.15; master = a.createGain(); master.gain.value = 0.8; master.connect(comp); comp.connect(a.destination); }
+    const out = a.createGain(); out.connect(master);
     const noise = (dur, f0, f1, q, gain, t0 = 0) => { const s = a.createBufferSource(); s.buffer = noiseBuf; s.playbackRate.value = 0.6 + Math.random() * 0.5; const f = a.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = q; f.frequency.setValueAtTime(f0, t + t0); f.frequency.exponentialRampToValueAtTime(f1, t + t0 + dur);
       const g = a.createGain(); g.gain.setValueAtTime(0.0001, t + t0); g.gain.exponentialRampToValueAtTime(gain, t + t0 + 0.015); g.gain.exponentialRampToValueAtTime(0.0001, t + t0 + dur); s.connect(f); f.connect(g); g.connect(out); s.start(t + t0, Math.random() * 0.5, dur + 0.05); };
     const tone = (dur, f0, f1, gain, t0 = 0) => { const o = a.createOscillator(); o.frequency.setValueAtTime(f0, t + t0); o.frequency.exponentialRampToValueAtTime(f1, t + t0 + dur); const g = a.createGain(); g.gain.setValueAtTime(gain, t + t0); g.gain.exponentialRampToValueAtTime(0.0001, t + t0 + dur); o.connect(g); g.connect(out); o.start(t + t0); o.stop(t + t0 + dur + 0.02); };

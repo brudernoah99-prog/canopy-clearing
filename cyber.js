@@ -110,7 +110,7 @@ export function makeCyberArm(scene, type, side, L1, L2, audio = null) {
     } else S.rev += (0 - S.rev) * Math.min(1, dt * 3);
     root.updateMatrixWorld(true);
     if (chain.length) { S.chainU += dt * (0.15 + 7.5 * S.rev); for (let i = 0; i < chain.N; i++) { const [p, a] = chain.place(S.chainU + i * chain.per / chain.N); chain[i].position.copy(p); chain[i].rotation.set(-a, 0, 0); } }
-    if (snd) { const now = snd.a.currentTime; snd.o.frequency.setTargetAtTime(55 + 120 * S.rev, now, 0.05); snd.g.gain.setTargetAtTime(S.built >= 1 && S.attached ? 0.025 + 0.09 * S.rev : 0, now, 0.08); snd.f.frequency.setTargetAtTime(500 + 1400 * S.rev, now, 0.05); }
+    if (snd) { const now = snd.a.currentTime; snd.o.frequency.setTargetAtTime(55 + 120 * S.rev, now, 0.05); snd.g.gain.setTargetAtTime(S.built >= 1 && S.attached ? 0.008 + 0.08 * S.rev : 0, now, 0.08); snd.f.frequency.setTargetAtTime(500 + 1400 * S.rev, now, 0.05); }
     const tp = tip.getWorldPosition(V()); S.tipVel.copy(tp).sub(S.prevTip).divideScalar(Math.max(dt, 1e-3)); S.prevTip.copy(tp);
     // sparks fall
     for (let i = 0; i < SP; i++) { if (spLife[i] <= 0) { spPos[i * 3 + 1] = -99; continue; } spLife[i] -= dt; spVel[i].y -= 9.8 * dt; spPos[i * 3] += spVel[i].x * dt; spPos[i * 3 + 1] += spVel[i].y * dt; spPos[i * 3 + 2] += spVel[i].z * dt; }
