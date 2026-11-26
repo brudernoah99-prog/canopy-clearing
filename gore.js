@@ -5,6 +5,7 @@
 //  - simple physics: pieces bounce off the world and each other; synthesized tearing / squelch / thud sounds
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { sliceObject } from './slicer.js';
 
 const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
 // joints in model space (Y up, facing +Z, origin at the feet) and which way the wound faces
@@ -45,6 +46,14 @@ export async function initGore(scene, addSplat, contact = null) {
     g.fillStyle = '#e9dec6'; g.beginPath(); g.ellipse(128, 222, 16, 12, 0, 0, 7); g.fill(); g.fillStyle = '#9a7b70'; g.beginPath(); g.arc(128, 222, 6, 0, 7); g.fill(); // spine
     const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t; })();
   const cutMat = new THREE.MeshStandardMaterial({ map: cutTex, roughness: 0.3, side: THREE.DoubleSide });
+  // a limb or head cut: fur rim, meat, a fat ring and the bone in the middle
+  const limbCutTex = (() => { const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d');
+    g.fillStyle = '#241c1a'; g.beginPath(); g.arc(64, 64, 63, 0, 7); g.fill(); g.fillStyle = '#d9a48c'; g.beginPath(); g.arc(64, 64, 57, 0, 7); g.fill();
+    g.fillStyle = '#8c1820'; g.beginPath(); g.arc(64, 64, 52, 0, 7); g.fill(); g.fillStyle = '#6a0c14'; for (let i = 0; i < 7; i++) { g.beginPath(); g.ellipse(64 + Math.cos(i) * 28, 64 + Math.sin(i * 1.7) * 26, 14, 9, i, 0, 7); g.fill(); }
+    g.fillStyle = '#efe4cf'; g.beginPath(); g.arc(60, 66, 13, 0, 7); g.fill(); g.fillStyle = '#c9a98a'; g.beginPath(); g.arc(60, 66, 6, 0, 7); g.fill();
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t; })();
+  const limbCutMat = new THREE.MeshStandardMaterial({ map: limbCutTex, roughness: 0.3, side: THREE.DoubleSide });
+  const capFor = (obj, isBody = false) => isBody || new THREE.Box3().setFromObject(obj).getSize(V()).length() > 0.75 ? cutMat : limbCutMat;
   // the model's built-in wound caps stay hidden until that part is actually torn off
   // (they close the seams between head, arms and body, so on an intact gorilla they are just dark fur, never hidden)
   const seamFur = new THREE.MeshStandardMaterial({ color: '#1c1816', roughness: 0.95 });
@@ -218,24 +227,60 @@ export async function initGore(scene, addSplat, contact = null) {
   const gutRope = (at, vel) => { const g = new THREE.Group(); g.position.copy(at); const pts = []; let p = V(); for (let i = 0; i < 6; i++) { pts.push(p.clone()); p = p.clone().add(V((Math.random() - 0.5) * 0.12, (Math.random() - 0.5) * 0.08, (Math.random() - 0.5) * 0.12)); }
     tube(pts, 0.02, gut, g); scene.add(g); loosen(g, vel, V(Math.random() * 6, Math.random() * 6, Math.random() * 6), 0.6, { jointLocal: pts[0], dirLocal: V(0, 1, 0) }, 0.08); };
 
-  // split the body down the middle: two clipped copies, each with a cut face, guts hanging out of it and spine showing
-  function splitBody(body, side, push) {
-    const c = V().fromArray(body.userData.c); const halves = [];
-    for (const sgn of [1, -1]) {
-      const h = sgn === 1 ? body : body.clone(true);
-      if (sgn === -1) { h.position.copy(body.position); h.quaternion.copy(body.quaternion); scene.add(h); }
-      const local = new THREE.Plane(V(sgn, 0, 0), sgn * c.x);          // keeps the side where sgn*x_model >= 0
-      const world = new THREE.Plane();
-      h.traverse(m => { if (m.isMesh) { m.material = m.material.clone(); m.material.clippingPlanes = [world]; m.material.side = THREE.DoubleSide; } });
-      const face = mk(circleGeo, cutMat, h); face.rotation.y = -sgn * Math.PI / 2; face.position.set(-c.x + sgn * 0.003, 0, 0); face.scale.set(bodySize.z * 0.46, bodySize.y * 0.44, 1);
-      // guts slipping out of the cut, hanging down
-      const o0 = V(-c.x, -0.05, 0.04), n = V(-sgn, 0, 0);
-      tube([o0, o0.clone().addScaledVector(n, 0.07).add(V(0, -0.08, 0.06)), o0.clone().addScaledVector(n, 0.12).add(V(0, -0.26, 0.1)), o0.clone().addScaledVector(n, 0.06).add(V(0.0, -0.42, 0.03))], 0.024, gut, h);
-      tube([o0.clone().add(V(0, 0.08, 0)), o0.clone().addScaledVector(n, 0.05).add(V(0, 0.0, 0.1)), o0.clone().addScaledVector(n, 0.09).add(V(0, -0.15, 0.15))], 0.018, meatLight, h);
-      const p = loosen(h, push.clone().multiplyScalar(0.9).addScaledVector(side, 1.6 * sgn).add(V(0, 1.2, 0)), V((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2, sgn * 3), 2.2, { jointLocal: V(-c.x, 0, 0), dirLocal: V(-sgn, 0, 0) }, RADIUS.half);
-      p.clip = { local, world }; halves.push(p);
+  // ---------- real cuts (chainsaw, pulling apart): any piece can be sliced anywhere, again and again ----------
+  const rnd = () => Math.random() - 0.5;
+  const capInfo = (h) => h.userData.capLocal ? { jointLocal: h.userData.capLocal.clone(), dirLocal: h.userData.capDir.clone() } : null;
+  const gutsAt = (h) => { if (!h.userData.capLocal || G.level !== 'full' || h.userData.size < 0.45) return; const o0 = h.userData.capLocal, n = h.userData.capDir;
+    tube([o0.clone(), o0.clone().addScaledVector(n, 0.06).add(V(0, -0.06, 0)), o0.clone().addScaledVector(n, 0.1).add(V(rnd() * 0.06, -0.22, rnd() * 0.06)), o0.clone().addScaledVector(n, 0.05).add(V(0, -0.36, 0))], 0.022, gut, h); };
+  // a loose thing (a piece, a held head, a body) is cut in two; both halves fly apart a little and bleed from the cut
+  function cutLoose(obj, planeW, vel = V(), gutsToo = false) {
+    const i = pieces.findIndex(p => p.o === obj); const old = i >= 0 ? pieces[i] : null;
+    if (obj.parent !== scene) scene.attach(obj);
+    const r = sliceObject(obj, planeW, capFor(obj, gutsToo)); if (!r) return null;
+    if (old) pieces.splice(pieces.indexOf(old), 1);
+    const base = old ? old.vel.clone() : vel.clone();
+    for (const [h, sg] of [[r.a, 1], [r.b, -1]]) {
+      if (gutsToo) gutsAt(h);
+      loosen(h, base.clone().addScaledVector(r.normal, 0.9 * sg).add(V(0, 0.6, 0)), V(rnd() * 5, rnd() * 5, rnd() * 5), 3.5, capInfo(h), Math.max(0.05, Math.min(0.3, h.userData.size * 0.3)));
     }
-    return halves;
+    return r;
+  }
+  // a standing (or carried) gorilla: a cut through a head or arm takes off what's beyond the cut and the rest stays on, bleeding;
+  // a cut through the body breaks the whole thing apart and slices the torso
+  function cutAvatar(avatar, name, planeW, push = V()) {
+    const P = avatar.userData.parts; const part = P[name]; if (!part) return null; const full = G.level === 'full';
+    avatar.updateMatrixWorld(true);
+    if (name === 'Body') {
+      const loose = breakApart(avatar, push);
+      const body = loose.Body; if (!body) return null;
+      return cutLoose(body, planeW, push.clone().multiplyScalar(0.5), true);
+    }
+    const r = sliceObject(part, planeW, capFor(part)); if (!r) return null;
+    const jw = avatar.localToWorld(JOINTS[name][0].at.clone());
+    const keepA = r.a.getWorldPosition(V()).distanceTo(jw) < r.b.getWorldPosition(V()).distanceTo(jw);
+    const keep = keepA ? r.a : r.b, off = keepA ? r.b : r.a;
+    keep.name = name; keep.userData.c = keep.position.toArray(); P[name] = keep;               // the stub stays on as that part
+    avatar.userData.bleeds.push({ body: keep, jointLocal: keep.userData.capLocal ? keep.userData.capLocal.clone() : V(), dirLocal: keep.userData.capDir.clone(), t: 0 }); bleedingAvatars.add(avatar);
+    loosen(off, push.clone().multiplyScalar(0.6).add(V(rnd(), 0.8, rnd())), V(rnd() * 6, rnd() * 6, rnd() * 6), 3.5, capInfo(off), Math.max(0.05, Math.min(0.25, off.userData.size * 0.3)));
+    return { keep, off };
+  }
+  // the whole gorilla becomes loose pieces where it stands (wounds at every joint), without flinging them
+  function breakApart(avatar, push = V()) {
+    avatar.updateMatrixWorld(true); const P = avatar.userData.parts; const full = G.level === 'full'; const out = {};
+    for (const name of ['Head', 'Arm_L', 'Arm_R']) if (P[name] && !P[name].userData.sliced) decorate(P[name], name, full);
+    if (P.Body) for (const j of JOINTS.Body) if (P[j.for]) woundAt(P.Body, j, full);
+    for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const o = P[name]; if (!o) continue;
+      const info = o.userData.sliced ? capInfo(o) : (name === 'Body' ? { jointLocal: NECK.clone().sub(V().fromArray(o.userData.c)), dirLocal: V(0, 1, 0) } : jointInfo(o, name));
+      loosen(o, push.clone().multiplyScalar(0.4).add(V(rnd() * 0.6, 0.4, rnd() * 0.6)), V(rnd() * 2, rnd() * 2, rnd() * 2), 2, info, RADIUS[name] || 0.2); out[name] = o; }
+    if (avatar.parent) avatar.parent.remove(avatar); bleedingAvatars.delete(avatar);
+    return out;
+  }
+  // pulled apart with two hands: the body is cut down the middle for real, guts hanging out of both halves
+  function splitBody(body, side, push) {
+    body.updateMatrixWorld(true); const c = body.getWorldPosition(V());
+    const r = cutLoose(body, new THREE.Plane().setFromNormalAndCoplanarPoint(side.clone().normalize(), c), push, true);
+    if (!r) loosen(body, push, V(1, 0, 1), 2, null, RADIUS.Body);
+    return r;
   }
 
   // tear one part off a standing avatar (you grabbed it): returns the piece, the avatar keeps a bleeding wound
@@ -281,7 +326,7 @@ export async function initGore(scene, addSplat, contact = null) {
     let at = V();
     if (P.Body) {
       at = P.Body.getWorldPosition(V());
-      if (opts.split && full) splitBody(P.Body, side, push);
+      if (opts.split && full) { scene.attach(P.Body); splitBody(P.Body, side, push); }
       else loosen(P.Body, push.clone().multiplyScalar(0.8).add(V(0, 0.6, 0)), V(2.2, 0, r()), 2.4, { jointLocal: NECK.clone().sub(V().fromArray(P.Body.userData.c)), dirLocal: V(0, 1, 0) }, RADIUS.Body);
     }
     scene.remove(avatar); bleedingAvatars.delete(avatar);
@@ -335,5 +380,5 @@ export async function initGore(scene, addSplat, contact = null) {
       }
     }
   }
-  return { G, makeAvatar, makeLimb, dismember, tearOff, update, spurt, sfx, audio, jointInfo };
+  return { G, makeAvatar, makeLimb, dismember, tearOff, update, spurt, sfx, audio, jointInfo, cutLoose, cutAvatar, breakApart, pieces };
 }

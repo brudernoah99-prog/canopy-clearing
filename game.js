@@ -350,17 +350,30 @@ function activeWeapons() {
 function updateCyberWeapons(dt) {
   for (const C of activeWeapons()) { const s = C.side; const h = handOf(s);
     if (C.type === 'chainsaw' && C.rev > 0.5) {
-      const pts = C.cutPoints();
-      for (const d of allDummies()) { d.cutCd = Math.max(0, (d.cutCd || 0) - dt); if (!d.a || d.grow < 1 || d.cutCd > 0) continue;
-        for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const part = d.a.userData.parts[name]; if (!part || !part.userData.lb) continue; const c = part.getWorldPosition(V());
-          const [mn, mx] = part.userData.lb; const m = name === 'Body' ? 0.0 : 0.04;   // is any point of the bar inside this part's box?
-          const hit = pts.find(p => { const q = part.worldToLocal(p.clone()); return q.x > mn[0] - m && q.x < mx[0] + m && q.y > mn[1] - m && q.y < mx[1] + m && q.z > mn[2] - m && q.z < mx[2] + m; }); if (!hit) continue;
-          d.cutCd = 0.3; const dir = c.clone().sub(camera.getWorldPosition(V())).setY(0).normalize();
-          gore.spurt(hit, dir.clone().add(V(0, 0.7, 0)), 45, 4); gore.spurt(hit, V(0, 1, 0), 20, 2.5); C.spark(hit, 8); gore.sfx('tear', 1.1);
-          if (name === 'Body') { if (d.a.userData.parts.Head && Math.random() < 0.5) { const r = gore.tearOff(d.a, 'Head'); if (r) { const L = addLimb(r, null); L.vel.set(dir.x * 1.5, 2.5, dir.z * 1.5); } } smashDummy(d, V(dir.z, 0, -dir.x), true); }
-          else { const r = gore.tearOff(d.a, name); if (r) { d.tornT = d.tornT ?? 0; const L = addLimb(r, null); L.vel.copy(c).sub(d.at).setY(0).normalize().multiplyScalar(2).add(V(0, 2.2, 0)); L.spin.set(Math.random() * 8, Math.random() * 8, Math.random() * 8); } }
-          if (h) pulse(h, 1, 160); break; }
-      }
+      // the revving bar slices whatever it passes through, along the blade: standing dummies, carried ones, pieces on the floor, things you hold
+      C.cutCd = Math.max(0, (C.cutCd || 0) - dt); if (C.cutCd > 0) continue;
+      const pts = C.cutPoints(); if (pts.length < 2) continue;
+      const bar = pts[pts.length - 1].clone().sub(pts[0]).normalize();
+      const mv = C.tipVel.clone(); let nrm = bar.clone().cross(mv.lengthSq() > 0.09 ? mv.normalize() : V(0, 1, 0)); if (nrm.lengthSq() < 1e-4) nrm = bar.clone().cross(V(1, 0, 0)); nrm.normalize();
+      const inBoxObj = (o, p, m) => { const lb = o.userData.lb; if (!lb) return false; const [mn, mx] = lb; const q = o.worldToLocal(p.clone());
+        return q.x > mn[0] - m && q.x < mx[0] + m && q.y > mn[1] - m && q.y < mx[1] + m && q.z > mn[2] - m && q.z < mx[2] + m; };
+      const push = C.tipVel.clone().setY(0); let hitAt = null;
+      for (const d of allDummies()) { if (!d.a || d.grow < 1) continue;
+        for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const part = d.a.userData.parts[name]; if (!part) continue;
+          const hit = pts.find(p => inBoxObj(part, p, name === 'Body' ? 0 : 0.03)); if (!hit) continue;
+          const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(nrm, hit);
+          const r = gore.cutAvatar(d.a, name, plane, push);
+          if (r) { hitAt = hit; if (name === 'Body') { d.a = null; if (d.loose) unpinLoose(d); else { d.respawn = 4.5; d.tornT = undefined; } } else d.tornT = d.tornT ?? 0; }
+          break; }
+        if (hitAt) break; }
+      if (!hitAt) for (const P of gore.pieces.slice()) { const o = P.o; if (!o.userData.lb || (o.userData.size ?? 1) < 0.14) continue;
+        const hit = pts.find(p => inBoxObj(o, p, 0.02)); if (!hit) continue;
+        if (gore.cutLoose(o, new THREE.Plane().setFromNormalAndCoplanarPoint(nrm, hit))) { hitAt = hit; break; } }
+      if (!hitAt) for (const L of limbs.slice()) { if (L.cyber || L.dummy || !L.o.userData.lb) continue; const o = L.o;
+        const hit = pts.find(p => inBoxObj(o, p, 0.02)); if (!hit) continue;
+        if (L.heldBy) L.heldBy.holding = null; limbs.splice(limbs.indexOf(L), 1);
+        if (gore.cutLoose(o, new THREE.Plane().setFromNormalAndCoplanarPoint(nrm, hit), L.vel)) { hitAt = hit; break; } }
+      if (hitAt) { C.cutCd = 0.12; gore.spurt(hitAt, nrm.clone().add(V(0, 0.6, 0)), 35, 3.5); gore.spurt(hitAt, nrm.clone().negate().add(V(0, 0.6, 0)), 20, 3); C.spark(hitAt, 6); gore.sfx('tear', 1.1); if (h) pulse(h, 1, 140); }
     }
     if (C.type === 'hammer') {
       const hp = C.headPoint.getWorldPosition(V()); const sp = C.tipVel.length();
@@ -798,6 +811,18 @@ function desktopView(t, dt, talk) {
     if (Math.floor(t) !== fake.cycle && t > 1.5) { fake.cycle = Math.floor(t); const d = dummies[fake.cycle % 5]; const kind = fake.cycle % 3;
       if (d.a && d.grow >= 1) { if (kind === 0 && d.a.userData.parts.Head) { const L = tearDummyPart(d, 'Head', null); if (L) L.vel.set((Math.random() - 0.5) * 2, 3.5, 2.5); }
         else smashDummy(d, V(Math.random() - 0.5, 0, 1), kind === 1); } }
+    updateDummies(dt, t, []); return;
+  }
+  if (VIEW === 'slice') {   // close-up of real cuts: 1.5 s diagonal through the right forearm, 2.5 s through the head, 3.5 s diagonally through the torso, 5 s re-cut a piece on the floor
+    if (info) info.style.display = 'none';
+    const d = dummies[2]; const at = d.at; const P = (x, y, z) => V(at.x + x, y, at.z + z);
+    const steps = [[1.5, 'Arm_R', P(-0.3, 0.55, 0), V(0.3, 1, 0.2)], [2.5, 'Head', P(0, 1.35, 0.05), V(0.2, 1, 0.6)], [3.5, 'Body', P(0, 0.85, 0), V(0.7, 1, 0.1)]];
+    fake.sl = fake.sl || 0;
+    if (fake.sl < steps.length && t > steps[fake.sl][0] && d.a && d.grow >= 1) { const [, name, pt, n] = steps[fake.sl]; fake.sl++;
+      const r = gore.cutAvatar(d.a, name, new THREE.Plane().setFromNormalAndCoplanarPoint(n.normalize(), pt), V(0, 0, 0.3)); if (name === 'Body' && r) { d.a = null; d.respawn = 99; } gore.spurt(pt, n, 30, 3); }
+    if (fake.sl === 3 && t > 5) { fake.sl = 4; const big = gore.pieces.filter(q => q.o.userData.lb && (q.o.userData.size ?? 1) > 0.3).sort((a, b) => (b.o.userData.size ?? 1) - (a.o.userData.size ?? 1))[0];
+      if (big) { big.o.updateMatrixWorld(true); const c = big.o.getWorldPosition(V()); gore.cutLoose(big.o, new THREE.Plane().setFromNormalAndCoplanarPoint(V(1, 0.3, 0.5).normalize(), c)); } }
+    camera.position.set(at.x + 0.9, 1.5, at.z + 1.5); camera.lookAt(at.x, 0.7, at.z);
     updateDummies(dt, t, []); return;
   }
   if (VIEW === 'carry') {   // 2.5 s grab dummy 3's body with the right hand and lift it, 5 s throw it; 7 s grab it off the floor, 8.5 s the left hand yanks it in half
