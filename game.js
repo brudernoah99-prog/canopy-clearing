@@ -23,7 +23,7 @@ const T = {
   maxArmReach: 1.1,     // a hand stuck further than this from your head lets go
   snapTurn: Math.PI / 4,
   ripPull: 0.26,        // how far (m) you have to yank a grabbed arm before it tears off
-  punchSpeed: 2.6,      // hand speed (m/s) that knocks a dummy apart
+  punchSpeed: 1.8,      // hand speed (m/s) that counts as a punch (dummies wobble and bleed)
   monsterScale: 1.35,   // how much bigger you are as the monster
 };
 
@@ -352,8 +352,9 @@ function addLimb(r, by) {
 function dummyPartNear(p) {
   let best = null, bd = Infinity;
   for (const d of dummies) { if (!d.a || d.grow < 1) continue;
-    for (const name of ['Head', 'Arm_L', 'Arm_R']) { const part = d.a.userData.parts[name]; if (!part) continue; const dist = part.getWorldPosition(V()).distanceTo(p);
-      if (dist < (name === 'Head' ? 0.2 : 0.24) && dist < bd) { bd = dist; best = { dummy: d, part: name, d0: dist }; } } }
+    for (const name of ['Head', 'Arm_L', 'Arm_R', 'Body']) { const part = d.a.userData.parts[name]; if (!part) continue; const dist = part.getWorldPosition(V()).distanceTo(p);
+      const reach = { Head: 0.23, Arm_L: 0.27, Arm_R: 0.27, Body: 0.36 }[name];
+      if (dist < reach && dist - (name === 'Body' ? 0.12 : 0) < bd) { bd = dist - (name === 'Body' ? 0.12 : 0); best = { dummy: d, part: name, d0: dist }; } } }
   return best;
 }
 function tearDummyPart(d, name, h) {
@@ -371,12 +372,48 @@ function release(h) {
   const L = h.holding; if (!L) return; h.holding = null; L.heldBy = null;
   L.vel.copy(h.vel).multiplyScalar(1.15); L.spin.set((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 10).multiplyScalar(Math.min(1, h.vel.length() / 3));
 }
+// while you pull on a dummy part it stretches toward your hand, and the controller buzzes harder, until it tears
+function letGoOfDummy(h) {
+  const G = h.ripGrab; if (G && G.dummy && G.obj && G.rest && G.obj.parent) G.obj.position.copy(G.rest); h.ripGrab = null;
+}
+function pullDummy(h, p) {
+  const G = h.ripGrab, d = G.dummy, part = d.a?.userData.parts[G.part]; if (!part) { h.ripGrab = null; return; }
+  if (!G.obj) { G.obj = part; G.rest = part.position.clone(); }
+  // how far the hand moved away from where it grabbed, measured against the part's resting place
+  part.position.copy(G.rest); d.a.updateMatrixWorld(true);
+  const restW = part.getWorldPosition(V()); const pull = restW.distanceTo(p) - G.d0;
+  if (G.part === 'Body') {
+    const other = hands.find(x => x !== h && x.ripGrab && x.ripGrab.dummy === d && x.ripGrab.part === 'Body');
+    if (other) {   // two hands on the body: pull them apart to tear it in half
+      const op = mode === 'monster' ? beastHandPos(sideOf(other)) : other.mesh.position; const sep = p.distanceTo(op);
+      if (G.sep0 === undefined) G.sep0 = sep; const k = clamp((sep - G.sep0) / 0.28, 0, 1);
+      if (k > 0.05) { pulse(h, 0.2 + 0.8 * k, 20); pulse(other, 0.2 + 0.8 * k, 20); }
+      d.a.scale.set(1 + 0.12 * k, 1, 1);   // it stretches before it gives
+      if (sep - G.sep0 > 0.28) { d.a.scale.setScalar(1); const push = p.clone().sub(op).setY(0); h.ripGrab = null; other.ripGrab = null; smashDummy(d, V(push.z, 0, -push.x), true); hands.forEach(x => pulse(x, 1, 300)); }
+      return;
+    }
+    G.sep0 = undefined; d.a.scale.setScalar(1);
+    const k = clamp(pull / 0.5, 0, 1); if (k > 0.05) pulse(h, 0.15 + 0.6 * k, 20);
+    d.w && (d.w.x += (p.z - restW.z) * 0.02, d.w.z += -(p.x - restW.x) * 0.02);
+    if (pull > 0.5) { h.ripGrab = null; smashDummy(d, p.clone().sub(restW), false); }   // yanked hard enough: it comes apart
+    return;
+  }
+  const k = clamp(pull / 0.24, 0, 1);
+  if (k > 0.03) { pulse(h, 0.2 + 0.7 * k, 20); const toward = d.a.worldToLocal(p.clone()).sub(G.rest); if (toward.lengthSq() > 1e-6) part.position.copy(G.rest).addScaledVector(toward.normalize(), 0.1 * k); }
+  if (Math.random() < k * 0.3) gore.spurt(restW.clone().lerp(p, 0.4), p.clone().sub(restW).normalize(), 1, 0.6);   // it starts to tear
+  if (pull > 0.24) { part.position.copy(G.rest); h.ripGrab = null; tearDummyPart(d, G.part, h); }
+}
 function updateRipping(dt) {
   for (const h of hands) {
     const s = sideOf(h), o = s === 'L' ? 'R' : 'L', g = gripOf(h), was = h.gripDown;
     h.gripDown = g > 0.7 ? true : g < 0.35 ? false : h.gripDown;
     if (mode === 'gorilla' && !me.armOn(s)) { if (h.holding) release(h); h.ripGrab = null; continue; }
-    const p = h.mesh.position;
+    const p = mode === 'monster' ? beastHandPos(s) : h.mesh.position;
+    // a held grip grabs as soon as the hand reaches a dummy part or a loose limb (not only at the moment you squeeze)
+    if (h.gripDown && was && !h.ripGrab && !h.holding) {
+      const near = limbs.find(L => !L.heldBy && L.o.position.distanceTo(p) < 0.25); const dp = dummyPartNear(p);
+      if (near) hold(near, h); else if (dp) { h.ripGrab = dp; pulse(h, 0.5, 40); }
+    }
     if (h.gripDown && !was) {
       const near = limbs.filter(L => !L.heldBy).sort((a, b) => a.o.position.distanceTo(p) - b.o.position.distanceTo(p))[0];
       const dp = dummyPartNear(p);
@@ -387,14 +424,8 @@ function updateRipping(dt) {
         if (bi >= 0) { h.ripGrab = { o, bi, d0: bd }; pulse(h, 0.4, 40); }
       }
     }
-    if (!h.gripDown) { if (h.holding) release(h); h.ripGrab = null; }
-    if (h.ripGrab && h.ripGrab.dummy) {   // pulling a dummy's head or arm off
-      const G = h.ripGrab, part = G.dummy.a?.userData.parts[G.part]; if (!part) { h.ripGrab = null; continue; }
-      const pull = part.getWorldPosition(V()).distanceTo(p) - G.d0; const k = clamp(pull / 0.22, 0, 1);
-      if (k > 0.05) pulse(h, 0.2 + 0.7 * k, 20);
-      if (pull > 0.22) { h.ripGrab = null; tearDummyPart(G.dummy, G.part, h); }
-      continue;
-    }
+    if (!h.gripDown) { if (h.holding) release(h); letGoOfDummy(h); }
+    if (h.ripGrab && h.ripGrab.dummy) { pullDummy(h, p); continue; }
     if (h.ripGrab) {
       if (!me.armOn(h.ripGrab.o)) { h.ripGrab = null; continue; }
       const q = me.armPoints(h.ripGrab.o)[h.ripGrab.bi]; const pull = q.distanceTo(p) - h.ripGrab.d0; const k = clamp(pull / T.ripPull, 0, 1);
@@ -433,7 +464,7 @@ function updateLimbs(dt) {
 let podBusy = 0;
 function updatePod(dt, t, headPos) {
   const inPod = Math.hypot(headPos.x - POD.x, headPos.z - POD.z) < 0.9 && headPos.y < 3.2 && mode === 'gorilla';
-  if (inPod) for (const s of ['L', 'R']) if (me.armGone(s)) { me.regrow(s); podBusy = 2.6; hands.forEach(h => pulse(h, 0.3, 120)); }
+  if (inPod) for (const s of ['L', 'R']) if (me.armGone(s)) { me.regrow(s); podBusy = me.GROW_TIME || 8; hands.forEach(h => pulse(h, 0.3, 120)); }
   podBusy = Math.max(0, podBusy - dt);
   const k = podBusy > 0 ? 1 : 0;
   podGlow.emissiveIntensity = 1.0 + 0.4 * Math.sin(t * 2) + k * (1.5 + Math.sin(t * 14));
@@ -459,53 +490,40 @@ function updateDummies(dt, t, hitters) {
   dummies.forEach((d, i) => {
     if (!d.a) { d.respawn -= dt; if (d.respawn <= 0) spawnDummy(d); return; }
     if (d.grow < 1) { d.grow = Math.min(1, d.grow + dt / 0.9); d.a.scale.setScalar(Math.max(0.01, easeOutBack(d.grow, 1.6))); }
-    if (d.tornT !== undefined) { d.tornT += dt; if (d.tornT > 12) { smashDummy(d, V(0, 0, 1)); return; } }   // a half-torn dummy collapses after a while
-    d.a.rotation.y = Math.sin(t * 0.8 + i) * 0.06;
+    if (d.tornT !== undefined) { d.tornT += dt; if (d.tornT > 25) { smashDummy(d, V(0, 0, 1)); return; } }   // a torn-up dummy falls apart after a while
+    // wobble: a springy tilt that punches push on
+    const w = d.w || (d.w = { x: 0, z: 0, vx: 0, vz: 0, cd: 0 }); w.cd -= dt;
+    w.vx += (-w.x * 70 - w.vx * 5) * dt; w.vz += (-w.z * 70 - w.vz * 5) * dt; w.x = clamp(w.x + w.vx * dt, -0.5, 0.5); w.z = clamp(w.z + w.vz * dt, -0.5, 0.5);
+    d.a.rotation.set(w.x, Math.sin(t * 0.8 + i) * 0.06, w.z);
+    const grabbed = hands.some(h => h.ripGrab && h.ripGrab.dummy === d);
     const c = d.at.clone().add(V(0, 0.75, 0));
-    for (const hit of hitters) {
-      const dx = hit.pos.x - c.x, dz = hit.pos.z - c.z, dy = hit.pos.y - c.y;
-      if (Math.hypot(dx, dz) < hit.r && Math.abs(dy) < 0.75 && hit.vel.length() > hit.speed) { smashDummy(d, hit.vel.lengthSq() > 0.01 ? hit.vel : V(0, 0, -1), !!hit.split); if (hit.h) pulse(hit.h, 1, 120); break; }
+    if (w.cd <= 0 && !grabbed) for (const hit of hitters) {
+      const dx = hit.pos.x - c.x, dz = hit.pos.z - c.z, dy = hit.pos.y - c.y; const sp = hit.vel.length();
+      if (Math.hypot(dx, dz) < hit.r && Math.abs(dy) < 0.7 && sp > hit.speed) {
+        const v = hit.vel.clone().setY(0); const f = Math.min(sp, 7) * 0.09;
+        if (v.lengthSq() > 1e-4) { v.normalize(); w.vx += v.z * f * 6; w.vz += -v.x * f * 6; }
+        gore.spurt(hit.pos.clone(), v.clone().add(V(0, 0.5, 0)), 6 + Math.round(sp * 2), 0.8 + sp * 0.3);
+        if (sp > 3) addSplat(V(c.x + v.x * 0.6, 0, c.z + v.z * 0.6), V(0, 1, 0), 0.25 + Math.random() * 0.3, 0.3);
+        gore.sfx('thud', Math.min(1, sp / 6)); gore.sfx('squelch', Math.min(1, sp / 8));
+        if (hit.h && hit.h.gamepad) pulse(hit.h, Math.min(1, 0.3 + sp / 8), 60);
+        w.cd = 0.22; break;
+      }
     }
   });
 }
 
 // ---------------- the monster (you, after pressing the button) ----------------
 const beast = makeMonster(scene); beast.g.visible = false;
-const BEAST_LEAN = 0.22;
-beast.torso.rotation.x = BEAST_LEAN; beast.g.updateMatrixWorld(true);
-const BEAST_EYE = beast.eyes[0].getWorldPosition(V()).add(beast.eyes[1].getWorldPosition(V())).multiplyScalar(0.5).sub(beast.g.position);
-let legPhase = 0;
-function updateBeast(head, inputs, dt, t, talk) {
-  const camPos = head.getWorldPosition(V()), camQ = head.getWorldQuaternion(new THREE.Quaternion());
-  const fwd = V(0, 0, -1).applyQuaternion(camQ); const yaw = Math.atan2(fwd.x, fwd.z), pitch = Math.asin(clamp(fwd.y, -1, 1));
-  const before = beast.g.position.clone();
-  beast.g.rotation.set(0, yaw, 0); beast.g.position.copy(camPos).sub(BEAST_EYE.clone().applyAxisAngle(V(0, 1, 0), yaw));
-  beast.torso.rotation.set(BEAST_LEAN, 0, 0); beast.neck.rotation.set(beast.NECK, 0, 0);
-  beast.head.rotation.set(-(BEAST_LEAN + beast.NECK) - pitch, 0, 0);
-  beast.jaw.rotation.x = 0.08 + 0.85 * talk;
-  beast.eyes.forEach(e => e.material.emissiveIntensity = 1.8 + Math.sin(t * 9) * 0.6 + talk * 2);
-  const speed = before.distanceTo(beast.g.position) / Math.max(dt, 1e-3);
-  legPhase += dt * (2 + Math.min(speed, 4) * 2.5); const amp = Math.min(0.5, speed * 0.25);
-  beast.legs.forEach((l, i) => l.rotation.x = Math.sin(legPhase + i * Math.PI) * amp);
-  beast.g.updateMatrixWorld(true);
-  // arms reach for your hands (arms[0] is on its right side)
-  for (const [k, s] of [[0, 'R'], [1, 'L']]) {
-    const a = beast.arms[k], inp = inputs[s]; a.sh.rotation.set(0, 0, 0); a.el.rotation.set(0, 0, 0); a.hand.rotation.set(0, 0, 0);
-    if (!inp || !inp.pos) continue;
-    const sx = s === 'L' ? 1 : -1; const pole = V(sx * 0.9, -0.5, -0.7).applyAxisAngle(V(0, 1, 0), yaw);
-    twoBoneIK(a.sh, a.el, a.hand, inp.pos, pole, 0.85, 0.88);
-    a.hand.quaternion.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(0.9, 0, 0)));   // claws forward
-  }
-  beast.g.updateMatrixWorld(true);
-}
-const beastHandPos = (s) => beast.arms[s === 'R' ? 0 : 1].hand.getWorldPosition(V());
+// the monster's body, arms, hands and fingers are driven inside monster.js (beast.updatePlayer / beast.handPos)
+function updateBeast(head, inputs, dt, t, talk) { beast.updatePlayer(head, inputs, dt, t, talk); }
+const beastHandPos = (s) => beast.handPos(s);
 // red flash inside your head when you change
 const flash = new THREE.Mesh(new THREE.SphereGeometry(0.25, 16, 12), new THREE.MeshBasicMaterial({ color: '#b00010', side: THREE.BackSide, transparent: true, opacity: 0, depthTest: false }));
 flash.renderOrder = 20; camera.add(flash);
 function setMode(m) {
   mode = m; const monster = m === 'monster';
   beast.g.visible = monster; me.root.visible = !monster && (renderer.xr.isPresenting || VIEW === 'rip');
-  beast.drips.forEach(d => d.visible = monster); beast.arms.forEach(a => a.bl.visible = monster);
+  beast.drips.forEach(d => d.visible = monster); beast.arms.forEach(a => a.bl.visible = false);
   flash.material.color.set(monster ? '#b00010' : '#20ff70'); flash.material.opacity = renderer.xr.isPresenting ? 0.5 : 0;
   hands.forEach(h => { h.stuck = null; if (h.holding) release(h); h.ripGrab = null; pulse(h, 1, monster ? 500 : 200); });
 }
@@ -562,9 +580,9 @@ function updateAvatar(head, inputs, dt, t, talk) {
 }
 function hittersFor(inputs) {
   const out = [];
-  if (mode === 'monster') for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos) out.push({ pos: beastHandPos(s), vel: h.vel || V(), r: 0.55, speed: 0.5, h: h.h, split: true }); }
-  else for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos && me.armOn(s)) out.push({ pos: h.pos, vel: h.vel || V(), r: 0.4, speed: T.punchSpeed, h: h.h }); }
-  for (const L of limbs) out.push({ pos: L.o.position, vel: L.vel, r: 0.5, speed: 2.0, h: L.heldBy });
+  if (mode === 'monster') for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos) out.push({ pos: beastHandPos(s), vel: h.vel || V(), r: 0.45, speed: T.punchSpeed * 0.8, h: h.h }); }
+  else for (const s of ['L', 'R']) { const h = inputs[s]; if (h && h.pos && me.armOn(s)) out.push({ pos: h.pos, vel: h.vel || V(), r: 0.38, speed: T.punchSpeed, h: h.h }); }
+  for (const L of limbs) if (!L.heldBy || L.heldBy.gamepad) out.push({ pos: L.o.position, vel: L.vel, r: 0.45, speed: 2.0, h: L.heldBy });
   return out;
 }
 
@@ -591,12 +609,12 @@ function desktopView(t, dt, talk) {
     if (VIEW === 'rip' && !me.root.visible) me.root.visible = true;
     const inp = fakeInputs(t, dt);
     if (VIEW === 'rip') {  // 0-2 s normal, 2 s the right hand rips the left arm off and pulls it away, 4 s throws it, 5 s regrow
-      const cyc = Math.floor(t / 8), ph = t % 8;
+      const cyc = Math.floor(t / 15), ph = t % 15;
       if (cyc !== fake.cycle) { fake.cycle = cyc; fake.ripped = false; fake.thrown = false; fake.regrown = false; }
       if (ph > 2 && !fake.ripped) { fake.ripped = true; const fh = { mesh: new THREE.Object3D(), vel: V(), holding: null }; fake.fh = fh; fh.mesh.position.copy(inp.R.pos); fh.mesh.quaternion.copy(inp.R.quat); ripArm('L', fh); }
       if (fake.fh && ph > 2 && ph < 4) { inp.R.pos.add(V(0.35 * Math.min(1, (ph - 2) * 2), 0.15, 0.1)); fake.fh.mesh.position.copy(inp.R.pos); fake.fh.vel.set(0.6, 0.3, 0.2); }
       if (ph > 4 && !fake.thrown && fake.fh) { fake.thrown = true; fake.fh.vel.set(1.5, 2.5, 1.2); release(fake.fh); }
-      if (ph > 5 && !fake.regrown) { fake.regrown = true; me.regrow('L'); podBusy = 2.6; }
+      if (ph > 5 && !fake.regrown) { fake.regrown = true; me.regrow('L'); podBusy = me.GROW_TIME || 8; }
     }
     updateAvatar(fake.head, inp, dt, t, talk);
     updateDummies(dt, t, hittersFor(inp));
@@ -612,6 +630,21 @@ function desktopView(t, dt, talk) {
       if (d.a && d.grow >= 1) { if (kind === 0 && d.a.userData.parts.Head) { const L = tearDummyPart(d, 'Head', null); if (L) L.vel.set((Math.random() - 0.5) * 2, 3.5, 2.5); }
         else smashDummy(d, V(Math.random() - 0.5, 0, 1), kind === 1); } }
     updateDummies(dt, t, []); return;
+  }
+  if (VIEW === 'grab') {   // the real grab code with fake hands: 1.5 s grab dummy 3's head and pull; 4.5 s both hands pull dummy 4 apart; 7 s punch dummy 2
+    if (info) info.style.display = 'none';
+    const [hl, hr] = [hands[0], hands[1]]; hl.handed = 'left'; hr.handed = 'right';
+    for (const h of [hl, hr]) if (!h.gamepad) h.gamepad = { buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })), hapticActuators: [] };
+    const d3 = dummies[2].at, d4 = dummies[3].at, d2 = dummies[1].at; const sm = (a, b, x) => sstep(a, b, x);
+    let pl = V(-1.2, 1.2, -4.0), pr = V(1.2, 1.2, -4.0), gl = 0, gr = 0;
+    if (t > 2 && t < 5) { const head = V(d3.x, 1.54, d3.z + 0.12); pr = head.clone().lerp(head.clone().add(V(0.1, 0.2, 0.6)), sm(3.0, 4.0, t)); gr = t > 2.5 ? 1 : 0; }
+    if (t > 5.5 && t < 8.5) { const body = V(d4.x, 0.95, d4.z + 0.15); const k = sm(6.5, 7.7, t); pl = body.clone().add(V(-0.15 - 0.3 * k, 0, 0.05)); pr = body.clone().add(V(0.15 + 0.3 * k, 0, 0.05)); gl = gr = t > 6 ? 1 : 0; }
+    if (t > 9 && t < 11) { pr = V(d2.x + 0.6 - 1.2 * sm(9.5, 9.7, t), 1.0, d2.z + 0.1); }
+    for (const [h, p, g] of [[hl, pl, gl], [hr, pr, gr]]) { const prev = h.mesh.position.clone(); h.mesh.position.copy(p); h.vel.copy(p).sub(prev).divideScalar(Math.max(dt, 1e-3)); h.gamepad.buttons[1].value = g; }
+    updateRipping(dt);
+    const inputs = { L: { pos: hl.mesh.position, vel: hl.vel, h: hl }, R: { pos: hr.mesh.position, vel: hr.vel, h: hr } };
+    camera.position.set(2.2, 1.7, -2.2); camera.lookAt(1.6, 0.9, -6);
+    updateDummies(dt, t, hittersFor(inputs)); return;
   }
   if (VIEW === 'head' || VIEW === 'split') {   // close-ups: a torn-off head held up, or a dummy cut in half
     if (info) info.style.display = 'none';

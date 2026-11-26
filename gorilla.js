@@ -34,7 +34,68 @@ export function twoBoneIK(upper, lower, end, target, pole, L1, L2) {
   aim(lower, end, S.clone().addScaledVector(dir, d));
 }
 const easeOutBack = (x, c = 1.25) => 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2);
-const GROW_TIME = 2.6;   // seconds for a ripped arm to grow back
+const GROW_TIME = 8;   // seconds for a ripped arm to grow back: blood rushes in, then muscle + tendons, then skin
+const ARM_BONE = /^(upperarm|forearm|hand|index\d|middle\d|ring\d|pinky\d|thumb\d)_(L|R)$/;
+const ramp = (a, b, x) => clamp((x - a) / (b - a), 0, 1);
+
+// fur/skin: arm fragments past the skin front are cut away, with a raw red edge right at the front
+function furRegrowShader(mat, U) {
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uSkinL = U.skinL; sh.uniforms.uSkinR = U.skinR;
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float armSide;\nattribute float armT;\nvarying float vArmSide;\nvarying float vArmT;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvArmSide = armSide; vArmT = armT;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform float uSkinL;\nuniform float uSkinR;\nvarying float vArmSide;\nvarying float vArmT;')
+      .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+        float skinFront = vArmSide > 0.5 ? uSkinL : (vArmSide < -0.5 ? uSkinR : 9.0);
+        if (vArmT > skinFront) discard;`)
+      .replace('#include <map_fragment>', `#include <map_fragment>
+        { float raw = (1.0 - smoothstep(0.0, 0.08, skinFront - vArmT)) * step(skinFront, 1.5);
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.42, 0.035, 0.045), raw * 0.9); }`);
+  };
+  mat.customProgramCacheKey = () => 'gorilla-fur-regrow';
+}
+// the inside layers of a regrowing arm: pulsing veins first, then striated muscle with pale tendons
+function layerShader(mat, U) {
+  mat.onBeforeCompile = (sh) => {
+    for (const k of ['bloodL', 'bloodR', 'muscleL', 'muscleR', 'skinL', 'skinR', 'time']) sh.uniforms['u' + k[0].toUpperCase() + k.slice(1)] = U[k];
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float armSide;\nattribute float armT;\nattribute float armA;\nvarying float vArmSide;\nvarying float vArmT;\nvarying float vArmA;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed -= objectNormal * 0.004;\nvArmSide = armSide; vArmT = armT; vArmA = armA;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform float uBloodL; uniform float uBloodR; uniform float uMuscleL; uniform float uMuscleR; uniform float uSkinL; uniform float uSkinR; uniform float uTime;
+        varying float vArmSide; varying float vArmT; varying float vArmA;`)
+      .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+        float sd = vArmSide;
+        if (abs(sd) < 0.5) discard;
+        float bF = sd > 0.0 ? uBloodL : uBloodR, mF = sd > 0.0 ? uMuscleL : uMuscleR, sF = sd > 0.0 ? uSkinL : uSkinR;
+        float t = vArmT, a = vArmA;
+        if (t > bF || t < sF - 0.03) discard;                       // not grown yet, or already under the skin
+        float l1 = abs(sin(a * 4.0 + sin(t * 23.0 + a * 2.0) * 0.9));
+        float l2 = abs(sin(a * 7.0 - sin(t * 31.0 + 1.3) * 1.2 + 2.0));
+        float l3 = abs(sin(a * 11.0 + t * 9.0 + sin(t * 47.0) * 0.6));
+        float vein = max(max(1.0 - smoothstep(0.08, 0.2, l1), (1.0 - smoothstep(0.05, 0.15, l2)) * 0.95), (1.0 - smoothstep(0.02, 0.09, l3)) * 0.75);
+        float muscle = 1.0 - smoothstep(mF - 0.04, mF, t);
+        if (muscle < 0.5 && vein < 0.4) discard;                    // ahead of the muscle only the vessels exist
+        float pulse = 0.5 + 0.5 * sin(t * 26.0 - uTime * 11.0);     // blood rushing outward along the vessels
+        float bloodHead = 1.0 - smoothstep(0.0, 0.08, bF - t);      // the leading tip of the blood glows brightest`)
+      .replace('#include <map_fragment>', `#include <map_fragment>
+        { float fib = 0.5 + 0.5 * sin(a * 30.0 + sin(t * 18.0) * 0.8);
+          float fib2 = 0.5 + 0.5 * sin(a * 63.0 + t * 5.0);
+          float handZone = smoothstep(0.78, 0.84, t);   // the hand has no clean axis: calmer fibres there
+          vec3 musc = mix(vec3(0.30, 0.025, 0.035), vec3(0.66, 0.11, 0.12), mix(fib * 0.75 + fib2 * 0.25, 0.45 + 0.15 * fib2, handZone));
+          float tz = smoothstep(0.38, 0.43, t) * (1.0 - smoothstep(0.50, 0.55, t)) + smoothstep(0.58, 0.63, t) * (1.0 - smoothstep(0.76, 0.8, t)) + smoothstep(0.8, 0.84, t) * 0.35;
+          float tendon = clamp(tz, 0.0, 1.0) * smoothstep(0.93, 0.995, abs(sin(a * 6.0 + sin(t * 12.0) * 0.3))) * mix(1.0, 0.6, handZone);
+          musc = mix(musc, vec3(0.88, 0.82, 0.72), tendon);
+          vec3 veinCol = mix(vec3(0.28, 0.0, 0.02), vec3(0.85, 0.05, 0.07), max(pulse, bloodHead));
+          diffuseColor.rgb = muscle > 0.5 ? mix(musc, veinCol, vein * 0.5 * (1.0 - tendon)) : veinCol; }`)
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = 0.32;')
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vein * max(pulse, bloodHead) * vec3(0.4, 0.0, 0.03) * (muscle > 0.5 ? 0.35 : 1.0);');
+  };
+  mat.customProgramCacheKey = () => 'gorilla-arm-layers';
+}
 
 export function makeGorilla(scene) {
   const root = SkeletonUtils.clone(gltf.scene); scene.add(root);
@@ -69,10 +130,40 @@ export function makeGorilla(scene) {
     g.add(new THREE.Mesh(new THREE.SphereGeometry(0.075, 14, 10), stumpMat)); const bn = new THREE.Mesh(new THREE.SphereGeometry(0.028, 10, 8), boneMat); bn.position.y = 0.05; g.add(bn);
     g.visible = false; stumps[s] = g;
   }
-  // materials that glow green while an arm regrows
-  // (each hand gets its own material copy so only the regrowing hand glows; the body only gets a faint shimmer)
-  const handMats = {}; for (const s of ['L', 'R']) { const hm = root.getObjectByName(`Hand_${s}`); if (hm && hm.material) { hm.material = hm.material.clone(); handMats[s] = hm.material; } }
-  const bodyMats = []; skinned.forEach(m => { if (!Object.values(handMats).includes(m.material) && m.material.emissive && !bodyMats.includes(m.material)) bodyMats.push(m.material); });
+  // ---- regrow layers ----
+  // per-vertex arm coordinates (computed once per geometry, at rest): armSide (+1 left arm, -1 right arm, 0 body),
+  // armT (0 at the shoulder .. 1 at the fingertips) and armA (angle around the arm, for fibres / vessels)
+  const U = {}; for (const k of ['bloodL', 'bloodR', 'muscleL', 'muscleR', 'skinL', 'skinR', 'time']) U[k] = { value: k === 'time' ? 0 : 9 };
+  const axis = {};
+  for (const s of ['L', 'R']) {
+    const S = wp(`upperarm_${s}`), m3 = wp(`middle3_${s}`), m2 = wp(`middle2_${s}`);
+    const tip = m3.clone().add(m3.clone().sub(m2).multiplyScalar(0.8)); const D = tip.clone().sub(S); const L = D.length(); D.normalize();
+    const u = V().crossVectors(D, Z).normalize(), w = V().crossVectors(D, u); axis[s] = { S, D, L, u, w };
+  }
+  const layers = [];
+  for (const mesh of skinned) {
+    const geo = mesh.geometry; const pos = geo.attributes.position, si = geo.attributes.skinIndex, sw = geo.attributes.skinWeight; if (!si || !sw) continue;
+    if (!geo.attributes.armSide) {
+      const bones = mesh.skeleton.bones; const sideOf = bones.map(b => { const m = ARM_BONE.exec(b.name); return m ? (m[2] === 'L' ? 1 : -1) : 0; });
+      const n = pos.count, aS = new Float32Array(n), aT = new Float32Array(n), aA = new Float32Array(n); const v = V(), r = V(); let any = false;
+      mesh.updateMatrixWorld(true);
+      for (let i = 0; i < n; i++) {
+        let wL = 0, wR = 0; for (let k = 0; k < 4; k++) { const sb = sideOf[si.array[i * 4 + k]] || 0, wt = sw.array[i * 4 + k]; if (sb > 0) wL += wt; else if (sb < 0) wR += wt; }
+        const side = wL > 0.4 ? 1 : wR > 0.4 ? -1 : 0; aS[i] = side; if (!side) continue; any = true;
+        const ax = axis[side > 0 ? 'L' : 'R']; v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld); r.copy(v).sub(ax.S);
+        const along = r.dot(ax.D); aT[i] = clamp(along / ax.L, 0, 1); r.addScaledVector(ax.D, -along); aA[i] = Math.atan2(r.dot(ax.w), r.dot(ax.u));
+      }
+      geo.setAttribute('armSide', new THREE.BufferAttribute(aS, 1)); geo.setAttribute('armT', new THREE.BufferAttribute(aT, 1)); geo.setAttribute('armA', new THREE.BufferAttribute(aA, 1));
+      geo.userData.hasArm = any;
+    }
+    if (!geo.userData.hasArm) continue;
+    mesh.material = mesh.material.clone(); furRegrowShader(mesh.material, U);
+    // the inside layers: same geometry and skeleton, slightly shrunk, only drawn while an arm is regrowing
+    const lm = new THREE.MeshStandardMaterial({ color: '#8a1018', roughness: 0.35, metalness: 0.05 }); layerShader(lm, U);
+    const layer = new THREE.SkinnedMesh(geo, lm); layer.bind(mesh.skeleton, mesh.bindMatrix); layer.bindMode = mesh.bindMode;
+    layer.position.copy(mesh.position); layer.quaternion.copy(mesh.quaternion); layer.scale.copy(mesh.scale); layer.frustumCulled = false; layer.castShadow = true; layer.visible = false;
+    mesh.parent.add(layer); layers.push(layer);
+  }
   for (const s of ['L', 'R']) for (const f of FINGERS) state.curl[f + s] = 0;
 
   function resetPose() { for (const [n, b] of Object.entries(B)) b.quaternion.copy(rest[n]); }
@@ -137,26 +228,30 @@ export function makeGorilla(scene) {
       }
       fingers(s, vals, 0.3 * state.brace[s]);
     }
-    // arms that were ripped off, or are growing back
-    let glow = 0;
+    // arms that were ripped off, or are growing back (8 s):
+    //   0-30%  the arm pushes out of the stump as a web of vessels, blood pulsing outward to the fingertips
+    //   27-64% muscle (fibres along the arm) and pale tendons fill in from the shoulder down
+    //   60-97% skin and fur wipe down over it, raw red at the edge; the fist opens at the very end
+    let growing = false; U.time.value += dt;
     for (const s of ['L', 'R']) {
       const A = state.arm[s];
       if (A.mode === 'grow') { A.t += dt / GROW_TIME; if (A.t >= 1) { A.t = 1; A.mode = 'on'; } }
       const p = A.mode === 'off' ? 0 : A.mode === 'on' ? 1 : A.t;
-      const wob = A.mode === 'grow' ? 1 + 0.035 * Math.sin(A.t * 38) * (1 - p) : 1;
-      // the upper arm pushes out first, then the forearm, then the hand, then the fingers unfurl
-      const sA = Math.max(0.02, easeOutBack(sstep(0.0, 0.5, p)) * wob), sB = Math.max(0.05, easeOutBack(sstep(0.3, 0.75, p))), sC = Math.max(0.05, easeOutBack(sstep(0.55, 0.9, p), 1.6));
+      const g = A.mode === 'grow';
+      const wob = g ? 1 + 0.03 * Math.sin(A.t * 60) * (1 - ramp(0, 0.3, p)) : 1;
+      const sA = Math.max(0.02, easeOutBack(sstep(0.0, 0.14, p), 0.8) * wob), sB = Math.max(0.05, easeOutBack(sstep(0.07, 0.21, p), 0.8)), sC = Math.max(0.05, easeOutBack(sstep(0.14, 0.28, p), 1.0));
       B[`upperarm_${s}`].scale.setScalar(p >= 1 ? 1 : sA); B[`forearm_${s}`].scale.setScalar(p >= 1 ? 1 : sB); B[`hand_${s}`].scale.setScalar(p >= 1 ? 1 : sC);
-      if (A.mode === 'grow') {
-        const open = sstep(0.7, 1.0, p), c = 1.25 * (1 - open) - 0.25 * Math.sin(open * Math.PI);   // fist that opens and stretches
+      U[`blood${s}`].value = g ? ramp(0.0, 0.3, p) * 1.06 : 9;
+      U[`muscle${s}`].value = g ? ramp(0.27, 0.64, p) * 1.08 : 9;
+      U[`skin${s}`].value = g ? 0.06 + ramp(0.6, 0.97, p) * 1.0 : 9;
+      if (g) {
+        growing = true;
+        const open = sstep(0.84, 1.0, p), c = 1.1 * (1 - open) - 0.25 * Math.sin(open * Math.PI);   // a loose fist that opens and stretches at the end
         fingers(s, { index: c, middle: c, ring: c, pinky: c, thumb: c * 0.7 }, 0.25 * Math.sin(open * Math.PI));
-        glow = Math.max(glow, Math.sin(p * Math.PI));
       }
-      const hg = A.mode === 'grow' ? Math.sin(p * Math.PI) * (0.75 + 0.25 * Math.sin(A.t * 30)) : 0;
-      if (handMats[s]) { handMats[s].emissive.set('#3dff7c'); handMats[s].emissiveIntensity = 0.12 * hg; }
-      stumps[s].visible = p < 0.25; stumps[s].scale.setScalar(1 - p / 0.25 * 0.6);
+      stumps[s].visible = p < 0.12; stumps[s].scale.setScalar(1 - p / 0.12 * 0.6);
     }
-    bodyMats.forEach(m => { m.emissive.set('#36ff7a'); m.emissiveIntensity = 0.012 * glow; });
+    layers.forEach(l => { l.visible = growing; });
     // voice: jaw + scream eyes
     B.jaw.quaternion.copy(rest.jaw).multiply(Q().setFromAxisAngle(X, 0.5 * talk));
     const scream = sstep(0.55, 0.9, talk); for (const s of ['L', 'R']) B[`eye_${s}`].scale.setScalar(1 + 0.45 * scream);
@@ -174,5 +269,5 @@ export function makeGorilla(scene) {
   const regrow = (s) => { if (state.arm[s].mode === 'off') { state.arm[s].mode = 'grow'; state.arm[s].t = 0; } };
   const armPoints = (s) => [`upperarm_${s}`, `forearm_${s}`, `hand_${s}`].map(wp);
   const shoulderPos = (s) => wp(`upperarm_${s}`);
-  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, armPoints, shoulderPos, state };
+  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, armPoints, shoulderPos, state, GROW_TIME };
 }

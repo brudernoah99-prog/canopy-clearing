@@ -45,7 +45,9 @@ export async function initGore(scene, addSplat, contact = null) {
     const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t; })();
   const cutMat = new THREE.MeshStandardMaterial({ map: cutTex, roughness: 0.3, side: THREE.DoubleSide });
   // the model's built-in wound caps stay hidden until that part is actually torn off
-  gltf.scene.traverse(o => { if (o.isMesh && o.material && o.material.name === 'Stump') { o.userData.stump = true; o.visible = false; o.material = meat; } });
+  // (they close the seams between head, arms and body, so on an intact gorilla they are just dark fur, never hidden)
+  const seamFur = new THREE.MeshStandardMaterial({ color: '#1c1816', roughness: 0.95 });
+  gltf.scene.traverse(o => { if (o.isMesh && o.material && o.material.name === 'Stump') { o.userData.stump = true; o.material = seamFur; } });
 
   // ---------- shared geometry ----------
   const capGeo = new THREE.SphereGeometry(1, 16, 10);
@@ -91,7 +93,7 @@ export async function initGore(scene, addSplat, contact = null) {
     }
     return g;
   }
-  const decorate = (piece, name, full, only = null) => { piece.traverse(m => { if (m.userData.stump) m.visible = true; }); for (const j of JOINTS[name] || []) if (!only || j.for === only) woundAt(piece, j, full); };
+  const decorate = (piece, name, full, only = null) => { piece.traverse(m => { if (m.userData.stump) m.material = meat; }); for (const j of JOINTS[name] || []) if (!only || j.for === only) woundAt(piece, j, full); };
   const jointInfo = (piece, name) => { const j = JOINTS[name][0]; const c = V().fromArray(piece.userData.c); return { jointLocal: j.at.clone().sub(c), dirLocal: j.dir.clone() }; };
 
   const partsOf = (root) => { const p = {}; root.traverse(o => { if (['Body', 'Head', 'Arm_L', 'Arm_R'].includes(o.name)) p[o.name] = o; }); return p; };
