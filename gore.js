@@ -14,6 +14,7 @@ export async function initGore(scene, addSplat) {
     gltf.scene.add(pivot); pivot.attach(o);
   }
   const partsOf = (root) => { const p = {}; root.traverse(o => { if (['Body', 'Head', 'Arm_L', 'Arm_R'].includes(o.name)) p[o.name] = o; }); return p; };
+  const makePart = (name) => { const o = gltf.scene.getObjectByName(name).clone(true); o.traverse(m => { if (m.isMesh) m.castShadow = true; }); return o; };
   const makeAvatar = () => { const a = gltf.scene.clone(true); a.userData.parts = partsOf(a); scene.add(a); return a; };
 
   // blood droplets (a fixed pool, reused)
@@ -41,7 +42,7 @@ export async function initGore(scene, addSplat) {
     for (let i = 0; i < 5; i++) addSplat(new THREE.Vector3(at.x + r() * 1.6, 0, at.z + r() * 1.6), new THREE.Vector3(0, 1, 0), 0.5 + Math.random() * 0.9);
     spurt(at.clone().setY(at.y + 0.4), new THREE.Vector3(0, 1, 0), 40, 3.5);
     corpses.push({ pieces, t: 0 });
-    while (corpses.length > 3) corpses.shift().pieces.forEach(p => scene.remove(p.o));
+    while (corpses.length > 7) corpses.shift().pieces.forEach(p => scene.remove(p.o));
   }
 
   const tmp = new THREE.Vector3(), q = new THREE.Quaternion();
@@ -66,5 +67,7 @@ export async function initGore(scene, addSplat) {
       if (d.position.y < 0.01) { d.visible = false; if (Math.random() < 0.08) addSplat(new THREE.Vector3(d.position.x, 0, d.position.z), new THREE.Vector3(0, 1, 0), 0.15 + Math.random() * 0.25); }
     }
   }
-  return { makeAvatar, dismember, update };
+  // let a single loose piece (e.g. an arm you threw) fall and bleed with the gore physics
+  function addLoose(o, vel, spin, bleed, stumpDir) { scene.attach(o); corpses.push({ pieces: [{ o, vel, spin, bleed, stumpDir, landed: false }], t: 0 }); while (corpses.length > 7) corpses.shift().pieces.forEach(p => scene.remove(p.o)); }
+  return { makeAvatar, makePart, dismember, update, spurt, addLoose };
 }

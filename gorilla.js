@@ -18,11 +18,23 @@ const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t 
 function setWorldQuat(bone, qWorld) {
   const pq = Q(); bone.parent.getWorldQuaternion(pq); bone.quaternion.copy(pq.invert().multiply(qWorld)); bone.updateMatrixWorld(true);
 }
-function aim(bone, childBone, target) {          // rotate a bone so that its child joint lands on target
+export function aim(bone, childBone, target) {          // rotate a bone so that its child joint lands on target
   const s = bone.getWorldPosition(V()), c = childBone.getWorldPosition(V());
   const q = Q().setFromUnitVectors(c.sub(s).normalize(), target.clone().sub(s).normalize());
   const wq = Q(); bone.getWorldQuaternion(wq); setWorldQuat(bone, q.multiply(wq));
 }
+
+// two-bone IK: rotate upper and lower so the end joint reaches target, the middle joint bending toward pole
+export function twoBoneIK(upper, lower, end, target, pole, L1, L2) {
+  const S = upper.getWorldPosition(V()); const toT = target.clone().sub(S);
+  const d = clamp(toT.length(), Math.abs(L1 - L2) + 0.02, L1 + L2 - 0.002); const dir = toT.normalize();
+  const a = (L1 * L1 - L2 * L2 + d * d) / (2 * d), h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  const bend = pole.clone().sub(dir.clone().multiplyScalar(pole.dot(dir))).normalize();
+  aim(upper, lower, S.clone().addScaledVector(dir, a).addScaledVector(bend, h));
+  aim(lower, end, S.clone().addScaledVector(dir, d));
+}
+const easeOutBack = (x, c = 1.25) => 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2);
+const GROW_TIME = 2.6;   // seconds for a ripped arm to grow back
 
 export function makeGorilla(scene) {
   const root = SkeletonUtils.clone(gltf.scene); scene.add(root);
@@ -47,7 +59,20 @@ export function makeGorilla(scene) {
     const basis = new THREE.Matrix4().makeBasis(fy.clone().cross(pz).normalize(), fy, pz.clone().sub(fy.clone().multiplyScalar(pz.dot(fy))).normalize());
     handOffset[s] = Q().setFromRotationMatrix(basis).invert().multiply(hq);           // hand bone relative to that frame
   }
-  const state = { curl: {}, brace: { L: 0, R: 0 }, headHidden: false };
+  const state = { curl: {}, brace: { L: 0, R: 0 }, headHidden: false, arm: { L: { mode: 'on', t: 1 }, R: { mode: 'on', t: 1 } } };
+  // a raw, red stump that shows at the shoulder while an arm is missing
+  const stumpMat = new THREE.MeshStandardMaterial({ color: '#8a0a10', roughness: 0.35, emissive: '#2a0003' });
+  const boneMat = new THREE.MeshStandardMaterial({ color: '#e8dcc4', roughness: 0.5 });
+  const stumps = {};
+  for (const s of ['L', 'R']) {
+    const g = new THREE.Group(); const sh = B[`shoulder_${s}`] || B[`upperarm_${s}`].parent; sh.add(g); g.position.copy(B[`upperarm_${s}`].position);
+    g.add(new THREE.Mesh(new THREE.SphereGeometry(0.075, 14, 10), stumpMat)); const bn = new THREE.Mesh(new THREE.SphereGeometry(0.028, 10, 8), boneMat); bn.position.y = 0.05; g.add(bn);
+    g.visible = false; stumps[s] = g;
+  }
+  // materials that glow green while an arm regrows
+  // (each hand gets its own material copy so only the regrowing hand glows; the body only gets a faint shimmer)
+  const handMats = {}; for (const s of ['L', 'R']) { const hm = root.getObjectByName(`Hand_${s}`); if (hm && hm.material) { hm.material = hm.material.clone(); handMats[s] = hm.material; } }
+  const bodyMats = []; skinned.forEach(m => { if (!Object.values(handMats).includes(m.material) && m.material.emissive && !bodyMats.includes(m.material)) bodyMats.push(m.material); });
   for (const s of ['L', 'R']) for (const f of FINGERS) state.curl[f + s] = 0;
 
   function resetPose() { for (const [n, b] of Object.entries(B)) b.quaternion.copy(rest[n]); }
@@ -112,6 +137,26 @@ export function makeGorilla(scene) {
       }
       fingers(s, vals, 0.3 * state.brace[s]);
     }
+    // arms that were ripped off, or are growing back
+    let glow = 0;
+    for (const s of ['L', 'R']) {
+      const A = state.arm[s];
+      if (A.mode === 'grow') { A.t += dt / GROW_TIME; if (A.t >= 1) { A.t = 1; A.mode = 'on'; } }
+      const p = A.mode === 'off' ? 0 : A.mode === 'on' ? 1 : A.t;
+      const wob = A.mode === 'grow' ? 1 + 0.035 * Math.sin(A.t * 38) * (1 - p) : 1;
+      // the upper arm pushes out first, then the forearm, then the hand, then the fingers unfurl
+      const sA = Math.max(0.02, easeOutBack(sstep(0.0, 0.5, p)) * wob), sB = Math.max(0.05, easeOutBack(sstep(0.3, 0.75, p))), sC = Math.max(0.05, easeOutBack(sstep(0.55, 0.9, p), 1.6));
+      B[`upperarm_${s}`].scale.setScalar(p >= 1 ? 1 : sA); B[`forearm_${s}`].scale.setScalar(p >= 1 ? 1 : sB); B[`hand_${s}`].scale.setScalar(p >= 1 ? 1 : sC);
+      if (A.mode === 'grow') {
+        const open = sstep(0.7, 1.0, p), c = 1.25 * (1 - open) - 0.25 * Math.sin(open * Math.PI);   // fist that opens and stretches
+        fingers(s, { index: c, middle: c, ring: c, pinky: c, thumb: c * 0.7 }, 0.25 * Math.sin(open * Math.PI));
+        glow = Math.max(glow, Math.sin(p * Math.PI));
+      }
+      const hg = A.mode === 'grow' ? Math.sin(p * Math.PI) * (0.75 + 0.25 * Math.sin(A.t * 30)) : 0;
+      if (handMats[s]) { handMats[s].emissive.set('#3dff7c'); handMats[s].emissiveIntensity = 0.12 * hg; }
+      stumps[s].visible = p < 0.25; stumps[s].scale.setScalar(1 - p / 0.25 * 0.6);
+    }
+    bodyMats.forEach(m => { m.emissive.set('#36ff7a'); m.emissiveIntensity = 0.012 * glow; });
     // voice: jaw + scream eyes
     B.jaw.quaternion.copy(rest.jaw).multiply(Q().setFromAxisAngle(X, 0.5 * talk));
     const scream = sstep(0.55, 0.9, talk); for (const s of ['L', 'R']) B[`eye_${s}`].scale.setScalar(1 + 0.45 * scream);
@@ -123,5 +168,11 @@ export function makeGorilla(scene) {
     B.head.scale.setScalar(hidden ? 0.001 : 1); headBits.forEach(m => { m.visible = !hidden; });
     B.head.updateMatrixWorld(true); skinned.forEach(m => m.skeleton.update());
   }
-  return { root, B, update, hideHead, fingers, resetPose, EYE };
+  const armOn = (s) => state.arm[s].mode === 'on';
+  const armGone = (s) => state.arm[s].mode === 'off';
+  const rip = (s) => { state.arm[s].mode = 'off'; state.arm[s].t = 0; };
+  const regrow = (s) => { if (state.arm[s].mode === 'off') { state.arm[s].mode = 'grow'; state.arm[s].t = 0; } };
+  const armPoints = (s) => [`upperarm_${s}`, `forearm_${s}`, `hand_${s}`].map(wp);
+  const shoulderPos = (s) => wp(`upperarm_${s}`);
+  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, armPoints, shoulderPos, state };
 }
