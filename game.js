@@ -650,6 +650,7 @@ function updateDummies(dt, t, hitters) {
 
 // ---------------- the monster (you, after pressing the button) ----------------
 const beast = makeMonster(scene); beast.g.visible = false;
+if (beast.setAudio) beast.setAudio(gore.audio);   // the chainsaw arm's engine sound
 // the monster's body, arms, hands and fingers are driven inside monster.js (beast.updatePlayer / beast.handPos)
 function updateBeast(head, inputs, dt, t, talk) { beast.updatePlayer(head, inputs, dt, t, talk); }
 const beastHandPos = (s) => beast.handPos(s);
@@ -772,6 +773,7 @@ function desktopView(t, dt, talk) {
   if (VIEW === 'rip' || VIEW === 'monster') {
     if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
     if (VIEW === 'monster' && mode !== 'monster') setMode('monster');
+    const vv = new URLSearchParams(location.search).get('variant'); if (vv && beast.setVariant && beast.variant !== vv) beast.setVariant(vv);
     if (VIEW === 'rip' && !me.root.visible) me.root.visible = true;
     const inp = fakeInputs(t, dt);
     if (VIEW === 'rip') {  // 0-2 s normal, 2 s the right hand rips the left arm off and pulls it away, 4 s throws it, 5 s regrow
@@ -787,6 +789,7 @@ function desktopView(t, dt, talk) {
     const A = new URLSearchParams(location.search).get('angle') || 'front';
     camera.position.copy({ front: V(0.6, 1.3, 5.0), side: V(2.8, 1.3, 6.9), hands: V(0.6, 1.15, 6.2) }[A] || V(0.6, 1.3, 5.0)); camera.lookAt(0.6, 1.1, 7.4);
     if (VIEW === 'monster') { camera.position.set(0.6, 2.0, 4.2); camera.lookAt(0.6, 1.3, 7.4); }
+    if (VIEW === 'monster') updateCyberWeapons(dt);
     return;
   }
   if (VIEW === 'dummies') {   // every second: rip a head off, split one in half, or smash one
