@@ -11,6 +11,9 @@ import { makeGorilla, twoBoneIK } from './gorilla.js';
 import { Reflector } from 'three/addons/objects/Reflector.js';
 import { makeCyberArm } from './cyber.js';
 import { makeEmotes } from './emotes.js';
+import { buildHall, fakeProgress } from './hall.js';
+import * as progress from './progress.js';
+import { buildOwner, ownerDesktopView } from './owner.js';
 
 // ---------------- tuning ----------------
 const T = {
@@ -23,6 +26,16 @@ const T = {
   velocityFrames: 6,    // frames averaged to work out your fling speed
   headRadius: 0.22,
   maxArmReach: 1.1,     // a hand stuck further than this from your head lets go
+  tapTime: 0.06,        // a touch shorter than this (s) that starts in the air is a "tap": you keep your momentum
+  airTime: 0.1,         // you count as airborne after this long (s) with no hand touching and your head not resting on anything
+  tapKeep: 0.8,         // share of your speed a tap keeps (the part going INTO the surface is always lost)
+  slapSpeed: 4,         // hand speed into a surface (m/s) that gives the full-strength slap sound + buzz
+  heavyLand: 4,         // falling faster than this (m/s) when your hands hit = heavy landing thump
+  hangGrip: 0.6,        // grip above this on a pipe/bar locks the hand on (hang); it lets go below 0.4
+  hangReach: 0.04,      // extra reach (m) for a squeezing hand to catch a bar
+  hangDamp: 0.25,       // swing damping per second while hanging (0 = swings forever)
+  hangAbove: 0.1,       // you only swing from grips at least this far (m) above your head; lower bars hold you like a planted hand
+  hangMaxFix: 0.05,     // most the swing's arm (rope) constraint may move your head in one frame (m)
   snapTurn: Math.PI / 4,
   ripPull: 0.26,        // how far (m) you have to yank a grabbed arm before it tears off
   punchSpeed: 1.8,      // hand speed (m/s) that counts as a punch (dummies wobble and bleed)
@@ -76,14 +89,16 @@ addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; cam
 
 // ---------------- colliders ----------------
 // every collider answers: closest point on its surface to p, and the outward normal there
+// tags on a collider: surfType = 'floor' | 'metal' | 'soft' | 'glass' (slap sound), hang = a pipe/bar a squeezed grip locks onto
 const colliders = [];
+const tagCol = (c, surfType = 'metal', hang = false) => { c.surfType = surfType; c.hang = hang; return c; };
 const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
 const clamp = THREE.MathUtils.clamp;
 const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const easeOutBack = (x, c = 1.4) => 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2);
-function groundCol() { return { surf(p) { return { point: V(p.x, 0, p.z), normal: V(0, 1, 0), inside: p.y < 0 }; } }; }
+function groundCol() { return { surfType: 'floor', surf(p) { return { point: V(p.x, 0, p.z), normal: V(0, 1, 0), inside: p.y < 0 }; } }; }
 function boxCol(min, max) {
-  return { surf(p) {
+  return { min, max, surf(p) {
     const inside = p.x > min.x && p.x < max.x && p.y > min.y && p.y < max.y && p.z > min.z && p.z < max.z;
     if (!inside) { const c = V(clamp(p.x, min.x, max.x), clamp(p.y, min.y, max.y), clamp(p.z, min.z, max.z)); const n = p.clone().sub(c); const l = n.length(); return { point: c, normal: l > 1e-6 ? n.divideScalar(l) : V(0, 1, 0), inside: false }; }
     const d = [p.x - min.x, max.x - p.x, p.y - min.y, max.y - p.y, p.z - min.z, max.z - p.z]; const i = d.indexOf(Math.min(...d));
@@ -112,7 +127,7 @@ function contact(p, r) {
   const list = (p.x > 100 && facColliders.length) ? facColliders : colliders;   // the big facility sits far away at x = 200
   for (const c of list) {
     const s = c.surf(p); const dist = s.inside ? -p.distanceTo(s.point) : p.distanceTo(s.point);
-    if (!best || dist < best.dist) best = { dist, point: s.point, normal: s.normal };
+    if (!best || dist < best.dist) best = { dist, point: s.point, normal: s.normal, surf: s.surfType || c.surfType || 'metal', hang: !!(s.hang || c.hang) };
   }
   best.rest = best.point.clone().addScaledVector(best.normal, r);
   return best;
@@ -134,7 +149,8 @@ const mat = (color, o = {}) => new THREE.MeshStandardMaterial({ color, roughness
 const metal = mat('#7d848c', { metalness: 0.55, roughness: 0.45 });
 const darkMetal = mat('#3e4349', { metalness: 0.6, roughness: 0.5 });
 const add = (geo, m, x, y, z, shadow = true) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = shadow; o.receiveShadow = true; scene.add(o); return o; };
-const box = (x, y, z, w, h, d, m, collide = true, shadow = true) => { const o = add(new THREE.BoxGeometry(w, h, d), m, x, y, z, shadow); if (collide) colliders.push(boxCol(V(x - w / 2, y - h / 2, z - d / 2), V(x + w / 2, y + h / 2, z + d / 2))); return o; };
+// (crates are 'soft', everything else 'metal' unless a tag is passed; hang = a bar you can grip)
+const box = (x, y, z, w, h, d, m, collide = true, shadow = true, surfType = m.map === crateTex ? 'soft' : 'metal', hang = false) => { const o = add(new THREE.BoxGeometry(w, h, d), m, x, y, z, shadow); if (collide) colliders.push(tagCol(boxCol(V(x - w / 2, y - h / 2, z - d / 2), V(x + w / 2, y + h / 2, z + d / 2)), surfType, hang)); return o; };
 const sign = (text, w, h, x, y, z, ry = 0, { bg = '#1d2126', fg = '#f2c41c', sub = '' } = {}) => {
   const t = canvasTex(512, Math.round(512 * h / w), (g, W, H) => { g.fillStyle = bg; g.fillRect(0, 0, W, H); g.strokeStyle = fg; g.lineWidth = 10; g.strokeRect(8, 8, W - 16, H - 16);
     g.fillStyle = fg; g.textAlign = 'center'; g.textBaseline = 'middle'; g.font = `900 ${Math.round(H * (sub ? 0.36 : 0.5))}px Arial`; g.fillText(text, W / 2, H * (sub ? 0.38 : 0.52), W - 40);
@@ -157,8 +173,8 @@ for (const z of [-7, -1, 5]) box(0, 6.75, z, 28, 0.35, 0.25, darkMetal, false, f
 for (const [x, z] of [[-7, -1], [7, -1], [-7, 6.5], [7, 6.5]]) { box(x, 3.5, z, 0.7, 7, 0.7, mat('#a3a9b0')); box(x, 0.3, z, 0.78, 0.6, 0.78, mat('#e0b31c', { map: hazardTex }), false); }
 // back catwalk + side catwalk with railings, crate steps up to it
 box(0, 3.5, -12.75, 27.5, 0.2, 2.5, metal); box(-12.75, 3.5, -3, 2.5, 0.2, 16, metal);
-box(0, 4.55, -11.55, 25.4, 0.07, 0.07, mat('#e0b31c')); for (let x = -12; x <= 12; x += 2) box(x, 4.05, -11.55, 0.06, 1.0, 0.06, darkMetal, false);
-box(-11.55, 4.55, -3.3, 0.07, 0.07, 15.4, mat('#e0b31c')); for (let z = -10; z <= 4; z += 2) box(-11.55, 4.05, z, 0.06, 1.0, 0.06, darkMetal, false);
+box(0, 4.55, -11.55, 25.4, 0.07, 0.07, mat('#e0b31c'), true, true, 'metal', true); for (let x = -12; x <= 12; x += 2) box(x, 4.05, -11.55, 0.06, 1.0, 0.06, darkMetal, false);
+box(-11.55, 4.55, -3.3, 0.07, 0.07, 15.4, mat('#e0b31c'), true, true, 'metal', true); for (let z = -10; z <= 4; z += 2) box(-11.55, 4.05, z, 0.06, 1.0, 0.06, darkMetal, false);
 const crate = new THREE.MeshStandardMaterial({ map: crateTex, roughness: 0.85 });
 box(-12.6, 0.5, 9.2, 1.6, 1.0, 1.6, crate); box(-12.6, 1.0, 7.6, 1.6, 2.0, 1.6, crate); box(-12.6, 1.5, 6.0, 1.6, 3.0, 1.6, crate);
 box(9.0, 0.5, 9.5, 1.0, 1.0, 1.0, crate); box(10.2, 0.5, 9.7, 1.0, 1.0, 1.0, crate); box(9.6, 1.5, 9.6, 1.0, 1.0, 1.0, crate);
@@ -168,11 +184,12 @@ box(11.6, 3.9, -7.5, 2.6, 2.6, 4.5, new THREE.MeshStandardMaterial({ map: contai
 // barrels
 for (const [x, z] of [[12.8, 1.0], [12.0, 1.8], [12.9, 2.6]]) { add(new THREE.CylinderGeometry(0.35, 0.35, 0.95, 16), mat('#c8781f', { metalness: 0.3, roughness: 0.5 }), x, 0.475, z); colliders.push(cylCol(x, z, 0.35, 0, 0.95)); }
 // monkey bars over the middle
-for (let i = 0; i < 8; i++) box(-6.2 + i * 0.6, 2.45, 2.5, 0.07, 0.07, 2.2, mat('#d0d5da', { metalness: 0.7, roughness: 0.3 }));
-for (const x of [-6.5, -1.6]) for (const z of [1.4, 3.6]) box(x, 1.25, z, 0.1, 2.5, 0.1, mat('#e0b31c'));
-box(-4.05, 2.45, 1.4, 5.0, 0.1, 0.1, mat('#e0b31c')); box(-4.05, 2.45, 3.6, 5.0, 0.1, 0.1, mat('#e0b31c'));
-// pipes along the right wall (decor)
-for (const [y, c] of [[5.6, '#5c7d4a'], [6.0, '#8a3b2f']]) { const p = add(new THREE.CylinderGeometry(0.12, 0.12, 25, 12), mat(c, { metalness: 0.4 }), 13.75, y, -1, false); p.rotation.x = Math.PI / 2; }
+for (let i = 0; i < 8; i++) box(-6.2 + i * 0.6, 2.45, 2.5, 0.07, 0.07, 2.2, mat('#d0d5da', { metalness: 0.7, roughness: 0.3 }), true, true, 'metal', true);
+for (const x of [-6.5, -1.6]) for (const z of [1.4, 3.6]) box(x, 1.25, z, 0.1, 2.5, 0.1, mat('#e0b31c'), true, true, 'metal', true);
+box(-4.05, 2.45, 1.4, 5.0, 0.1, 0.1, mat('#e0b31c'), true, true, 'metal', true); box(-4.05, 2.45, 3.6, 5.0, 0.1, 0.1, mat('#e0b31c'), true, true, 'metal', true);
+// pipes along the right wall: grip them to hang and swing (a thin box collider each)
+for (const [y, c] of [[5.6, '#5c7d4a'], [6.0, '#8a3b2f']]) { const p = add(new THREE.CylinderGeometry(0.12, 0.12, 25, 12), mat(c, { metalness: 0.4 }), 13.75, y, -1, false); p.rotation.x = Math.PI / 2;
+  colliders.push(tagCol(boxCol(V(13.63, y - 0.12, -13.5), V(13.87, y + 0.12, 11.5)), 'metal', true)); }
 // signs
 sign('FACILITY 7', 6, 1.4, 0, 5.6, -13.99, 0, { sub: 'SUBJECT TESTING HALL' });
 // the test dummy area: a hazard line and five stands
@@ -213,10 +230,10 @@ sign('HOW TO', 1.6, 1.2, 4.75, 1.7, 8.3, -Math.PI / 2, { fg: '#f2c41c', sub: '' 
 box(4.8, 1.7, 8.3, 0.06, 1.3, 1.7, darkMetal, true, false);
 const mirror = new Reflector(new THREE.PlaneGeometry(2.4, 2.6), { textureWidth: 1024, textureHeight: 1024, color: 0xc4ccd0 });
 mirror.position.set(-3.2, 1.45, 8.3); mirror.rotation.y = Math.PI / 2; scene.add(mirror);
-box(-3.27, 1.45, 8.3, 0.12, 2.9, 2.7, mat('#3e4349'));
+box(-3.27, 1.45, 8.3, 0.12, 2.9, 2.7, mat('#3e4349'), true, true, 'glass');   // the mirror (slaps sound like glass)
 
 // ---------------- hands ----------------
-const hands = [0, 1].map(i => ({ i, grip: renderer.xr.getControllerGrip(i), mesh: new THREE.Object3D(), stuck: null, gamepad: null, handed: null, prev: null, vel: V(), gripDown: false, holding: null, ripGrab: null }));
+const hands = [0, 1].map(i => ({ i, grip: renderer.xr.getControllerGrip(i), mesh: new THREE.Object3D(), stuck: null, gamepad: null, handed: null, prev: null, vel: V(), gripDown: false, holding: null, ripGrab: null, hang: false, reach: 0, prevT: null }));
 hands.forEach(h => { rig.add(h.grip); scene.add(h.mesh); h.grip.addEventListener('connected', e => { h.gamepad = e.data.gamepad; h.handed = e.data.handedness; }); h.grip.addEventListener('disconnected', () => { h.gamepad = null; }); });
 const sideOf = (h) => h.handed === 'left' ? 'L' : h.handed === 'right' ? 'R' : (h.i === 0 ? 'L' : 'R');
 const handOf = (s) => hands.find(h => sideOf(h) === s);
@@ -227,47 +244,102 @@ const vel = V(); const history = []; let wasTouching = false; let turnLatch = fa
 const handWorld = (h) => h.grip.getWorldPosition(V());
 let mode = 'gorilla';   // or 'monster'
 const canPush = (h) => mode === 'monster' || me.armOn(sideOf(h));
+// one "touch" = from the first hand touching until no hand touches: short ones that start in the air are momentum taps
+const touch = { t: 0, air: false, vel: V(), n: [V(), V()], nc: 0, hang: false };
+let airT = 0, headRest = false;   // seconds with no hand touching; head resting on something last frame
+// let go of a hand (and forget its last position, so the next touch isn't read as a huge-speed slap)
+const freeHand = (h) => { h.stuck = null; h.hang = false; h.reach = 0; h.prevT = null; };
+const _hv = V(), _hp = V(), _rp = V(), _kv = V();   // scratch vectors (no per-frame allocation)
+// a squeezing hand on a bar locks on only when there is nothing grabbable (limbs, dummies) in reach: those win
+const canHang = (h, p) => !h.holding && !h.ripGrab && !(mode === 'gorilla' && me.isCyber(sideOf(h)))
+  && !limbs.some(L => !L.heldBy && L.o.position.distanceTo(p) < 0.32) && !dummyPartNear(p);
+// the first frame a hand touches: a slap that is as heavy as the hand (and body) was moving into the surface
+function slap(h, c, hv, buzz = true) {
+  const sp = hv.lengthSq() < 400 ? -hv.dot(c.normal) : 0;   // > 20 m/s is a teleport / snap turn, not a slap
+  const k = clamp(sp / T.slapSpeed, 0.1, 1);
+  if (buzz) pulse(h, 0.15 + 0.85 * k, 20 + 40 * k);
+  gore.sfx('slap_' + c.surf, k);
+}
+const heavyLanding = (fall) => { gore.sfx('land', clamp((fall - T.heavyLand) / 6, 0.2, 1)); hands.forEach(x => pulse(x, 1, 120)); };
 
 function step(dt) {
   rig.updateMatrixWorld(true);
-  let move = V(), n = 0;
-  const head = camera.getWorldPosition(V());
+  let move = V(), n = 0, hangN = 0, swingN = 0;
+  const head = camera.getWorldPosition(V()), reachMax = T.maxArmReach * rig.scale.x;
   for (const h of hands) {
     if (!h.gamepad && !renderer.xr.isPresenting) continue;
-    if (!canPush(h)) { h.stuck = null; continue; }               // no arm, no push
+    if (!canPush(h) || owner.noclip) { freeHand(h); continue; }               // no arm, no push
     const tracked = handWorld(h);
-    if (h.stuck) {
+    // how fast the tracked hand moves in the world (its own swing + the body falling / flying); no last position = no slap
+    const fresh = !h.prevT;
+    if (!fresh) _hv.copy(tracked).sub(h.prevT).divideScalar(Math.max(dt, 1e-3)); else _hv.set(0, 0, 0);
+    h.prevT = (h.prevT || V()).copy(tracked);
+    const g = gripOf(h);
+    if (h.stuck && h.hang) {   // locked onto a bar: only opening the grip, grabbing something else, a cyber arm, or overreaching lets go
+      if (g < 0.4 || h.holding || h.ripGrab || (mode === 'gorilla' && me.isCyber(sideOf(h))) || Math.max(h.stuck.distanceTo(head), head.distanceTo(tracked)) > reachMax) { h.stuck = null; h.hang = false; h.reach = 0; }
+      else { h.reach = Math.max(0.15, head.distanceTo(tracked)); move.add(h.stuck.clone().sub(tracked)); n++; hangN++; if (h.stuck.y > head.y + T.hangAbove) swingN++; }
+    } else if (h.stuck) {
       const c = contact(tracked, T.handRadius);
-      const tooFar = h.stuck.distanceTo(head) > T.maxArmReach * rig.scale.x;
+      const tooFar = h.stuck.distanceTo(head) > reachMax;
       const away = tracked.clone().sub(h.stuck).dot(h.normal);
       if (away > 0.004 || c.dist > T.handRadius + T.releaseSlack || tooFar) h.stuck = null;
-      else { move.add(h.stuck.clone().sub(tracked)); n++; }
+      else {
+        if (c.hang && g > T.hangGrip && canHang(h, tracked)) { h.hang = true; h.reach = Math.max(0.15, head.distanceTo(tracked)); hangN++; if (h.stuck.y > head.y + T.hangAbove) swingN++; pulse(h, 0.8, 60); touch.hang = true; }   // squeezed while on a bar
+        move.add(h.stuck.clone().sub(tracked)); n++;
+      }
     } else {
       const c = contact(tracked, T.handRadius);
-      if (c.dist < T.handRadius + T.touchSlack) {
-        h.stuck = c.dist < T.handRadius ? c.rest : tracked.clone();
-        h.normal = c.normal.clone();
+      const grab = c.hang && g > T.hangGrip && c.dist < T.handRadius + T.touchSlack + T.hangReach && canHang(h, tracked);
+      if (grab || c.dist < T.handRadius + T.touchSlack) {
+        h.stuck = (grab || c.dist < T.handRadius) ? c.rest : tracked.clone();
+        h.normal = c.normal.clone(); h.hang = grab;
+        if (!wasTouching && !n) { touch.t = 0; touch.air = airT >= T.airTime && !headRest; touch.vel.copy(vel); touch.nc = 0; touch.hang = false; }   // a new touch starts
+        if (touch.nc < 2) touch.n[touch.nc++].copy(c.normal);
+        if (!fresh) slap(h, c, _hv, !grab);
+        if (grab) { h.reach = Math.max(0.15, head.distanceTo(tracked)); hangN++; if (h.stuck.y > head.y + T.hangAbove) swingN++; touch.hang = true; pulse(h, 0.8, 60); }   // firm buzz: locked on
         move.add(h.stuck.clone().sub(tracked)); n++;
-        pulse(h, 0.25, 30);
       }
     }
   }
-  if (n > 0) {
+  if (n > hangN && !wasTouching && vel.y < -T.heavyLand) heavyLanding(-vel.y);   // hands hit after a big fall (catching a bar isn't a landing)
+  if (n > 0 && swingN === n) {
+    // hanging from bars above your head (and nothing else holds you): a pendulum. Gravity acts, and each arm is a rope as long as
+    // the real arm's current stretch: it only pulls the head back when it's further than that (never pushes), so pulling your arm in /
+    // pumping swings you; position-based velocity. Lower bars (swingN < n) hold you like a planted hand instead (no tipping over).
+    _rp.copy(rig.position);
+    vel.y -= T.gravity * dt; vel.multiplyScalar(Math.max(0, 1 - T.hangDamp * dt)); rig.position.addScaledVector(vel, dt);
+    for (let it = 0; it < 2; it++) for (const h of hands) if (h.stuck && h.hang) {
+      _hp.copy(head).add(rig.position).sub(_rp);   // the head after this frame's rig move (the rig only translates here)
+      const d = _hp.distanceTo(h.stuck); if (d <= h.reach) continue;
+      _kv.copy(_hp).sub(h.stuck).multiplyScalar(h.reach / d - 1); if (_kv.length() > T.hangMaxFix) _kv.setLength(T.hangMaxFix);
+      rig.position.add(_kv);
+    }
+    vel.copy(rig.position).sub(_rp).divideScalar(Math.max(dt, 1e-3)); if (vel.length() > T.maxJumpSpeed) vel.setLength(T.maxJumpSpeed);
+    history.push(vel.clone()); if (history.length > T.velocityFrames) history.shift();
+    wasTouching = true; touch.t += dt; airT = 0;
+  } else if (n > 0) {
     move.divideScalar(n); rig.position.add(move);
     history.push(move.clone().divideScalar(dt)); if (history.length > T.velocityFrames) history.shift();
-    vel.set(0, 0, 0); wasTouching = true;
+    vel.set(0, 0, 0); wasTouching = true; touch.t += dt; airT = 0;
   } else {
+    airT += dt;
     if (wasTouching && history.length) {
       vel.set(0, 0, 0); history.forEach(v => vel.add(v)); vel.divideScalar(history.length).multiplyScalar(T.jumpMultiplier);
+      // a quick tap while flying keeps the momentum: drop only the part going into the surface, keep tapKeep of the rest, plus the push
+      if (touch.air && touch.t < T.tapTime && !touch.hang) {
+        _kv.copy(touch.vel); for (let i = 0; i < touch.nc; i++) { const into = _kv.dot(touch.n[i]); if (into < 0) _kv.addScaledVector(touch.n[i], -into); }
+        vel.addScaledVector(_kv, T.tapKeep);
+      }
       if (vel.length() > T.maxJumpSpeed) vel.setLength(T.maxJumpSpeed);
     }
     wasTouching = false; history.length = 0;
-    vel.y -= T.gravity * dt; rig.position.addScaledVector(vel, dt);
+    vel.y -= owner.gravity(T.gravity) * dt; owner.fly(vel, dt, handOf('L')?.gamepad); rig.position.addScaledVector(vel, dt);   // owner FLY: no gravity, left stick flies
   }
   rig.updateMatrixWorld(true);
   const hp = camera.getWorldPosition(V()); const hc = contact(hp, T.headRadius);
-  if (hc.dist < T.headRadius) { rig.position.add(hc.rest.clone().sub(hp)); const into = vel.dot(hc.normal); if (into < 0) vel.addScaledVector(hc.normal, -into); }
-  if (rig.position.y < -30) { rig.position.set(0, 0, 8); vel.set(0, 0, 0); }
+  headRest = hc.dist < T.headRadius + 0.01;
+  if (hc.dist < T.headRadius && !owner.noclip) { rig.position.add(hc.rest.clone().sub(hp)); const into = vel.dot(hc.normal); if (into < 0) { if (into < -T.heavyLand && hc.normal.y > 0.6 && !hangN) heavyLanding(-into); vel.addScaledVector(hc.normal, -into); } }   // (no landing thump while hanging)
+  if (rig.position.y < -30) { rig.position.set(0, 0, 8); vel.set(0, 0, 0); hands.forEach(freeHand); }
   snapTurn();
 }
 function snapTurn() {
@@ -275,7 +347,7 @@ function snapTurn() {
   if (Math.abs(ax) < 0.3) { turnLatch = false; return; } if (turnLatch || Math.abs(ax) < 0.7) return; turnLatch = true;
   const head = camera.getWorldPosition(V()); const a = -Math.sign(ax) * T.snapTurn;
   rig.position.sub(head).applyAxisAngle(V(0, 1, 0), a).add(head); rig.rotation.y += a;
-  hands.forEach(h => { if (h.stuck) h.stuck = null; });
+  hands.forEach(h => { if (h.stuck && h.hang) h.prevT = null; else freeHand(h); });   // a hand hanging on a bar keeps its grip (the grip point doesn't move when you turn)
 }
 function updateHands(dt) {
   rig.updateMatrixWorld(true);
@@ -679,7 +751,7 @@ function setMode(m) {
   beast.g.visible = monster; me.root.visible = !monster && (renderer.xr.isPresenting || VIEW === 'rip');
   beast.drips.forEach(d => d.visible = monster); beast.arms.forEach(a => a.bl.visible = false);
   flash.material.color.set(monster ? '#b00010' : '#20ff70'); flash.material.opacity = renderer.xr.isPresenting ? 0.5 : 0;
-  hands.forEach(h => { h.stuck = null; if (h.holding) release(h); h.ripGrab = null; pulse(h, 1, monster ? 500 : 200); });
+  hands.forEach(h => { freeHand(h); if (h.holding) release(h); h.ripGrab = null; pulse(h, 1, monster ? 500 : 200); });
 }
 let btnArmed = true, btnPress = 0;
 function updateButton(dt, t, points) {
@@ -718,7 +790,7 @@ function updateNotice(dt) {
 }
 // rig size: smoothly grow when you're the monster, keeping your head where it is
 function updateScale(dt) {
-  const target = mode === 'monster' ? T.monsterScale : 1; const s = rig.scale.x; if (Math.abs(s - target) < 1e-3) return;
+  const target = owner.scale(mode === 'monster' ? T.monsterScale : 1); const s = rig.scale.x; if (Math.abs(s - target) < 1e-3) return;
   rig.updateMatrixWorld(true); const before = camera.getWorldPosition(V());
   rig.scale.setScalar(s + (target - s) * Math.min(1, dt * 3)); rig.updateMatrixWorld(true);
   const after = camera.getWorldPosition(V()); rig.position.x += before.x - after.x; rig.position.z += before.z - after.z;
@@ -760,7 +832,7 @@ let NPCmod = null; async function ensureNPC() { if (!NPCmod) NPCmod = await impo
 function teleport(feet, yaw = 0) {
   rig.rotation.y = yaw; rig.updateMatrixWorld(true);
   const off = camera.position.clone().setY(0).applyAxisAngle(V(0, 1, 0), yaw);
-  rig.position.set(feet.x - off.x, feet.y, feet.z - off.z); vel.set(0, 0, 0); history.length = 0; hands.forEach(h => { h.stuck = null; if (h.holding) release(h); h.ripGrab = null; });
+  rig.position.set(feet.x - off.x, feet.y, feet.z - off.z); vel.set(0, 0, 0); history.length = 0; hands.forEach(h => { freeHand(h); if (h.holding) release(h); h.ripGrab = null; });
 }
 // big message in front of you
 const banner = (() => { const c = document.createElement('canvas'); c.width = 1024; c.height = 400; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
@@ -847,7 +919,7 @@ function updateModes(dt, t, talk = 0) {
     const near = Math.min(...G7.monsters.map(m => m.pos.distanceTo(head)));
     if (G7.phase === 'play' && near < 9 && Math.random() < dt * (10 - near) * 0.5) hands.forEach(h => pulse(h, 0.15 + (9 - near) * 0.04, 30));   // heartbeat when one is close
     setWrist(G7.keys >= 3 ? 'EXIT OPEN' : `KEYS ${G7.keys}/3`, G7.phase === 'intro' ? `wake in ${Math.max(0, 10 - G7.t).toFixed(0)}s` : `${Math.floor(G7.t)}s`, G7.keys >= 3 ? '#3dff7c' : '#29c8ff');
-    if (G7.phase === 'play' && G7.keys >= 3 && fac.exit.isOpen() && head.distanceTo(fac.exit.pos) < fac.exit.radius) { const tt = G7.t; G7.phase = 'won'; G7.t = 0; showBanner('YOU ESCAPED', `in ${Math.floor(tt)} seconds`, '#3dff7c', 5); }
+    if (G7.phase === 'play' && G7.keys >= 3 && fac.exit.isOpen() && head.distanceTo(fac.exit.pos) < fac.exit.radius) { const tt = G7.t; G7.phase = 'won'; G7.t = 0; const best = hall.recordEscape(tt); showBanner('YOU ESCAPED', `${best ? 'NEW BEST: ' : 'in '}${Math.floor(tt)} seconds`, '#3dff7c', 5); }
     if (G7.phase === 'caught' && G7.t > 0.45 && !G7.torn) { G7.torn = true;   // you get torn apart where you stood
       const a = gore.makeAvatar(); a.position.set(head.x, Math.max(0, head.y - 1.3), head.z); a.rotation.y = rig.rotation.y; gore.dismember(a, V(0, 0, 1).applyAxisAngle(V(0, 1, 0), rig.rotation.y), {});
       me.root.visible = false; showBanner('YOU WERE CAUGHT', 'Back to the lobby...', '#ff3a3a', 4); }
@@ -862,8 +934,8 @@ function updateModes(dt, t, talk = 0) {
     }
     const left = G7.total - G7.caught; const tl = Math.max(0, G7.endT - G7.t);
     setWrist(`LEFT ${left}`, `${Math.floor(tl / 60)}:${String(Math.floor(tl % 60)).padStart(2, '0')}`, '#ff3a3a');
-    if (G7.phase === 'play' && left <= 0) { G7.phase = 'won'; G7.t = 0; showBanner('ALL CAUGHT', 'You are the apex specimen', '#3dff7c', 5); }
-    if (G7.phase === 'play' && tl <= 0) { G7.phase = 'lost'; G7.t = 0; showBanner('TIME UP', `${left} got away`, '#ff3a3a', 5); }
+    if (G7.phase === 'play' && left <= 0) { G7.phase = 'won'; G7.t = 0; const best = hall.recordMonster(G7.caught, G7.total, tl); showBanner('ALL CAUGHT', best ? `NEW RECORD: ${Math.floor(tl / 60)}:${String(Math.floor(tl % 60)).padStart(2, '0')} to spare` : 'You are the apex specimen', '#3dff7c', 5); }
+    if (G7.phase === 'play' && tl <= 0) { G7.phase = 'lost'; G7.t = 0; hall.recordMonster(G7.caught, G7.total, 0); showBanner('TIME UP', `${left} got away`, '#ff3a3a', 5); }
     if ((G7.phase === 'won' || G7.phase === 'lost') && G7.t > 5) backToLobby(G7.phase === 'won' ? ['YOU WIN', 'Be the Monster cleared', '#3dff7c'] : ['THEY GOT AWAY', 'Try again at the mode wall', '#ff3a3a']);
   }
 }
@@ -888,6 +960,11 @@ const modeBtns = MODES.map(([id, label, col, sub], i) => {
   return { id, cap, pos: V(x, 1.08, z), armed: true };
 });
 sign('GAME MODES', 3.2, 0.7, -9.2, 2.6, 6.4, Math.PI / 2, { fg: '#ffd23a', sub: 'TOUCH A BUTTON' });
+// fur dye vats (right of the mirror) + trophy shelf (next to the mode wall): hall.js; choices/records saved by progress.js
+const hall = buildHall({ scene, gore, me, mirrorPos: mirror.position, modeWallPos: V(-9.2, 0, 6.4), progress, rig, banner: showBanner, collide: (a, b) => colliders.push(boxCol(a, b)), active: () => G7.mode === 'sandbox' });
+const hallPulse = (k, ms) => hands.forEach(h => pulse(h, k, ms)), NO_PTS = [];
+// owner menu (owner.js): STAFF keypad by the MODES wall unlocks it; left palm to your face opens it
+const owner = buildOwner({ THREE, scene, rig, camera, pulse, showBanner, gameMode: () => G7.mode });
 function updateModeWall(points) {
   if (G7.mode !== 'sandbox') return;
   for (const B of modeBtns) { const near = points.some(p => p.distanceTo(B.pos) < 0.16 * rig.scale.x);
@@ -912,6 +989,38 @@ function fakeInputs(t, dt, H = V(0.6, +(new URLSearchParams(location.search).get
   return inp;
 }
 function desktopView(t, dt, talk) {
+  if (VIEW === 'move') {   // ?view=move: hang bars/pipes outlined green, surface tags of probe points logged ('[move] ...');
+    // &cam=pipes looks at the wall pipes; &sim=hang|tap|plant runs the REAL step() with a fake hand (camera = your head) and logs the result
+    if (info) info.style.display = 'none';
+    const qs = new URLSearchParams(location.search), sim = qs.get('sim');
+    if (!fake.mv) { fake.mv = true;
+      for (const c of colliders) if (c.hang && c.min) scene.add(new THREE.Box3Helper(new THREE.Box3(c.min.clone().addScalar(-0.02), c.max.clone().addScalar(0.02)), 0x3dff7c));
+      const probe = (k, p) => { const c = contact(p, T.handRadius); console.log('[move]', k, 'surf=' + c.surf, 'hang=' + c.hang, 'dist=' + c.dist.toFixed(3)); };
+      for (const [k, p] of Object.entries({ floor: V(0, 0.05, 0), wall: V(13.95, 2, 0), crate: V(9.0, 1.05, 9.5), mirror: V(-3.15, 1.5, 8.3), monkeyBar: V(-4.4, 2.39, 2.5), barPost: V(-6.5, 1.25, 1.31),
+        pipe: V(13.75, 5.45, 0), catwalkRail: V(0, 4.62, -11.55), barrel: V(12.8, 1.0, 1.0), podBase: V(POD.x, 0.25, POD.z), button: V(BTN.x, 1.0, BTN.z) })) probe(k, p);
+      ensureFacility().then(f => { const O = f.origin; for (const [k, p] of Object.entries({ facFloor: V(5, 0.05, 5), facWall: V(-14.25, 2, 5), facCrate: V(-12.6, 1.25, 9.2), facPipe: V(-15, 2.55, 0),
+        facMonkeyBar: V(-11.6, 3.22, -1), facCageBar: V(-1, 2, -9.1), facRail: V(-6, 4.55, -12.1), facMaintPipe: V(0, 5.0, 24.4), facCatwalk: V(-6, 3.55, -13) })) probe(k, p.clone().add(O)); });
+    }
+    if (sim) {   // one fake left hand (the right one is off), held still relative to the body like a player's arm
+      const h = hands[0]; h.handed = 'left'; hands[1].gamepad = null; h.grip.matrixAutoUpdate = true;   // (XR sets grip matrices itself; here we move it by position)
+      if (!h.gamepad) h.gamepad = { buttons: Array.from({ length: 6 }, () => ({ value: 0, pressed: false, touched: false })), hapticActuators: [] };
+      if (!fake.sim) { fake.sim = { n: 0, logT: 0, stuckN: 0, done: false };
+        const sfx0 = gore.sfx; gore.sfx = (ty, k = 1) => { console.log('[move] sfx', ty, (+k).toFixed(2)); sfx0(ty, k); };   // log the slap / land sounds
+        camera.position.set(0, 1.4, 0);
+        if (sim === 'hang') { rig.position.set(-4.05, 0.45, 2.5); h.grip.position.set(-0.35, 1.895, 0); camera.rotation.set(0.6, Math.PI / 2, 0, 'YXZ'); }   // hand under the bar at x -4.4, head 0.35 m to the side
+        else { rig.position.set(12.0, 1.6, 0); h.grip.position.set(0.6, 1.2, 0); vel.set(4, 1.0, 0); camera.rotation.set(0, -Math.PI / 2, 0, 'YXZ'); }   // flying at the right wall
+      }
+      const S = fake.sim; h.gamepad.buttons[1].value = sim === 'hang' && t < 6 ? 1 : 0;
+      if (sim !== 'hang' && h.stuck) { S.stuckN++; if (S.stuckN === 1) S.before = vel.clone(); if (S.stuckN >= (sim === 'tap' ? 3 : 12)) h.grip.position.x = 0.45; }   // pull the hand off the wall
+      step(dt); updateHands(dt);
+      if (sim === 'hang' && t > S.logT) { S.logT = t + 0.25; const hp = camera.getWorldPosition(V()); console.log('[move] hang t=' + t.toFixed(2), 'hang=' + h.hang, 'head x=' + hp.x.toFixed(3) + ' y=' + hp.y.toFixed(3), 'vel=' + vel.toArray().map(v => v.toFixed(2)).join(',')); }
+      if (sim !== 'hang' && S.stuckN && !h.stuck && !S.done) { S.done = true; console.log('[move] ' + sim + ': frames on wall=' + S.stuckN, 'vel before=' + S.before.toArray().map(v => v.toFixed(2)).join(','), 'vel after=' + vel.toArray().map(v => v.toFixed(2)).join(',')); }
+      updateDummies(dt, t, []); return;
+    }
+    if (qs.get('cam') === 'pipes') { camera.position.set(10.5, 4.6, 7.5); camera.lookAt(13.75, 5.6, -2); }
+    else { camera.position.set(1.5, 3.4, 7.5); camera.lookAt(-4.0, 2.0, 2.5); }
+    updateDummies(dt, t, []); return;
+  }
   if (VIEW === 'cyber') {   // chainsaw on the left, hammer on the right, standing at the dummies; 1 s: the arms build; 5 s: rev + cut; 8 s: hammer swing
     if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
     if (!me.root.visible) me.root.visible = true;
@@ -1040,13 +1149,23 @@ function desktopView(t, dt, talk) {
     if (VIEW === 'head') { camera.position.set(0.15, 1.45, -4.0); camera.lookAt(0, 1.35, -4.9); } else { camera.position.set(0.9, 1.6, -3.2); camera.lookAt(0, 0.3, -5.6); }
     updateDummies(dt, t, []); return;
   }
+  if (VIEW === 'hall') {   // ?view=hall : dye vats + trophy shelf, all unlocked in memory (fakeProgress, not saved), fur colour cycles every 2 s; &cam=shelf
+    if (info) info.style.display = 'none'; document.querySelectorAll('button').forEach(b => b.style.display = 'none');
+    if (!fake.hall) { fake.hall = true; fakeProgress(); me.root.visible = true; }
+    const i = Math.floor(t / 2) % hall.DYES.length; if (i !== fake.dye) { fake.dye = i; hall.preview(i); }
+    const inp = fakeInputs(t, dt, V(0.15, 1.45, 10.2)); fake.head.rotation.set(0, 0.25, 0); fake.head.updateMatrixWorld(true); updateAvatar(fake.head, inp, dt, t, talk);
+    if (new URLSearchParams(location.search).get('cam') === 'shelf') { camera.position.set(-7.3, 1.5, 9.9); camera.lookAt(-9.2, 0.8, 9.9); }
+    else { camera.position.set(-1.0, 1.9, 7.2); camera.lookAt(-1.6, 0.9, 11.2); }
+    updateDummies(dt, t, []); return;
+  }
+  if (VIEW === 'owner') { if (info) info.style.display = 'none'; ownerDesktopView(owner, t, dt, { THREE, scene, camera }); updateBanner(); updateDummies(dt, t, []); return; }   // ?view=owner: keypad + owner menu
   if (VIEW === 'spawn') { if (info) info.style.display = 'none'; const yaw = +(new URLSearchParams(location.search).get('yaw') || 0); camera.position.set(0, 1.4, 8); camera.rotation.set(-0.08, yaw, 0, 'YXZ'); updateDummies(dt, t, []); return; }
   // overview: drift slowly around the hall
   const a = t * 0.08; camera.position.set(Math.sin(a) * 9, 4.2, 2 + Math.cos(a) * 8); camera.lookAt(0, 1.2, -2);
   updateDummies(dt, t, []);
 }
 
-renderer.xr.addEventListener('sessionstart', () => { camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); rig.position.set(0, 0, 8); vel.set(0, 0, 0); voice.start(); gore.audio(); me.root.visible = mode === 'gorilla'; if (info) info.style.display = 'none'; if (gore.G.level === 'full') noticeT = 0; });
+renderer.xr.addEventListener('sessionstart', () => { camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); rig.position.set(0, 0, 8); vel.set(0, 0, 0); hands.forEach(freeHand); voice.start(); gore.audio(); me.root.visible = mode === 'gorilla'; if (info) info.style.display = 'none'; if (gore.G.level === 'full') noticeT = 0; });
 renderer.xr.addEventListener('sessionend', () => { if (info) info.style.display = ''; });
 
 const clock = new THREE.Clock();
@@ -1067,14 +1186,14 @@ renderer.setAnimationLoop(() => {
     updateCyberArms(dt, t, inputs, mode === 'gorilla'); updateCyberWeapons(dt);
     updateDummies(dt, t, hittersFor(inputs));
     const pts = mode === 'monster' ? ['L', 'R'].map(beastHandPos) : hands.filter(canPush).map(h => h.mesh.position);
-    updateButton(dt, t, pts); updateGoreSwitch(dt, pts); updateModeWall(pts); updateModes(dt, t, talk);
+    updateButton(dt, t, pts); updateGoreSwitch(dt, pts); updateModeWall(pts); hall.update(dt, t, pts, hallPulse); updateModes(dt, t, talk); owner.update(dt, t, inputs, camera);
     updatePod(dt, t, camera.getWorldPosition(V()));
   } else {
-    desktopView(t, dt, talk); updateButton(dt, t, []); if (VIEW !== 'pod') updatePod(dt, t, V(0, 0, 100));
+    desktopView(t, dt, talk); if (window.CAM) { rig.updateMatrixWorld(true); camera.position.copy(rig.worldToLocal(window.CAM.p.clone())); camera.updateMatrixWorld(true); camera.lookAt(window.CAM.t); }   // desktop test hook: window.CAM = { p, t } (world) overrides the view camera hall.update(dt, t, NO_PTS, null); updateButton(dt, t, []); if (VIEW !== 'pod') updatePod(dt, t, V(0, 0, 100));
   }
   updateLimbs(dt); gore.update(dt); updateSplats(dt); updateNotice(dt);
   flash.material.opacity = Math.max(0, flash.material.opacity - dt * 0.6);
   renderer.render(scene, camera);
 });
 document.getElementById('mic')?.addEventListener('click', async (e) => { e.target.textContent = (await voice.start()) ? 'Mic on: talk!' : 'No mic found'; });
-window.GAME = { catchNPC, G7, startMode, backToLobby, looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };
+window.GAME = { renderer, owner, step, updateHands, vel, camera, catchNPC, G7, startMode, backToLobby, looseDummies, cyber, giveCyberArm, openChoice, voice, mirror, me, beast, T, rig, hands, limbs, dummies, colliders, contact, scene, gore, setMode, ripArm, get mode() { return mode; }, get t() { return clock.elapsedTime; } };

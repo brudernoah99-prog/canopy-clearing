@@ -41,23 +41,31 @@ const GROW_TIME = 8;   // seconds for a ripped arm to grow back: blood rushes in
 const ARM_BONE = /^(upperarm|forearm|hand|index\d|middle\d|ring\d|pinky\d|thumb\d)_(L|R)$/;
 const ramp = (a, b, x) => clamp((x - a) / (b - a), 0, 1);
 
-// fur/skin: arm fragments past the skin front are cut away, with a raw red edge right at the front
-function furRegrowShader(mat, U) {
+// fur/skin: arm fragments past the skin front are cut away, with a raw red edge right at the front.
+// dye (body material only): saturated orange fur texels get a new hue, keeping their light/dark; the grey face,
+// chest and palms (unsaturated), the dark red mouth (no g-b gap) and very dark texels are left alone. uFurOn = 0 is the untouched texture.
+const FUR_DYE = `
+        if (uFurOn > 0.5) { vec3 c = diffuseColor.rgb; float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+          float s = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+          float furMask = smoothstep(0.12, 0.3, s) * smoothstep(0.012, 0.03, c.g - c.b) * smoothstep(0.1, 0.14, lum);
+          diffuseColor.rgb = mix(c, uFurColor * lum * 1.8 * uFurGain, furMask); }`;
+function furRegrowShader(mat, U, dye = false) {
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uSkinL = U.skinL; sh.uniforms.uSkinR = U.skinR;
+    if (dye) { sh.uniforms.uFurColor = U.furColor; sh.uniforms.uFurOn = U.furOn; sh.uniforms.uFurGain = U.furGain; }
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', '#include <common>\nattribute float armSide;\nattribute float armT;\nvarying float vArmSide;\nvarying float vArmT;')
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvArmSide = armSide; vArmT = armT;');
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', '#include <common>\nuniform float uSkinL;\nuniform float uSkinR;\nvarying float vArmSide;\nvarying float vArmT;')
+      .replace('#include <common>', '#include <common>\nuniform float uSkinL;\nuniform float uSkinR;\nvarying float vArmSide;\nvarying float vArmT;' + (dye ? '\nuniform vec3 uFurColor;\nuniform float uFurOn;\nuniform float uFurGain;' : ''))
       .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
         float skinFront = vArmSide > 0.5 ? uSkinL : (vArmSide < -0.5 ? uSkinR : 9.0);
         if (vArmT > skinFront) discard;`)
-      .replace('#include <map_fragment>', `#include <map_fragment>
+      .replace('#include <map_fragment>', `#include <map_fragment>${dye ? FUR_DYE : ''}
         { float raw = (1.0 - smoothstep(0.0, 0.08, skinFront - vArmT)) * step(skinFront, 1.5);
           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.42, 0.035, 0.045), raw * 0.9); }`);
   };
-  mat.customProgramCacheKey = () => 'gorilla-fur-regrow';
+  mat.customProgramCacheKey = () => dye ? 'gorilla-fur-regrow-dye' : 'gorilla-fur-regrow';   // the colour is a uniform: dyeing never recompiles
 }
 // the inside layers of a regrowing arm: pulsing veins first, then striated muscle with pale tendons
 function layerShader(mat, U) {
@@ -138,6 +146,7 @@ export function makeGorilla(scene, opts = {}) {
   // per-vertex arm coordinates (computed once per geometry, at rest): armSide (+1 left arm, -1 right arm, 0 body),
   // armT (0 at the shoulder .. 1 at the fingertips) and armA (angle around the arm, for fibres / vessels)
   const U = {}; for (const k of ['bloodL', 'bloodR', 'muscleL', 'muscleR', 'skinL', 'skinR', 'time']) U[k] = { value: k === 'time' ? 0 : 9 };
+  U.furColor = { value: new THREE.Color() }; U.furOn = { value: 0 }; U.furGain = { value: 1 };
   const axis = {};
   for (const s of ['L', 'R']) {
     const S = wp(`upperarm_${s}`), m3 = wp(`middle3_${s}`), m2 = wp(`middle2_${s}`);
@@ -161,7 +170,7 @@ export function makeGorilla(scene, opts = {}) {
       geo.userData.hasArm = any;
     }
     if (!geo.userData.hasArm) continue;
-    mesh.material = mesh.material.clone(); furRegrowShader(mesh.material, U);
+    mesh.material = mesh.material.clone(); furRegrowShader(mesh.material, U, /^Ape_Body/.test(mesh.material.name));
     // the inside layers: same geometry and skeleton, slightly shrunk, only drawn while an arm is regrowing
     const lm = new THREE.MeshStandardMaterial({ color: '#8a1018', roughness: 0.35, metalness: 0.05 }); layerShader(lm, U);
     const layer = new THREE.SkinnedMesh(geo, lm); layer.bind(mesh.skeleton, mesh.bindMatrix); layer.bindMode = mesh.bindMode;
@@ -283,7 +292,13 @@ export function makeGorilla(scene, opts = {}) {
   const armGone = (s) => state.arm[s].mode === 'off';
   const rip = (s) => { state.arm[s].mode = 'off'; state.arm[s].t = 0; };
   const regrow = (s) => { if (state.arm[s].mode === 'off') { state.arm[s].mode = 'grow'; state.arm[s].t = 0; } };
+  // fur dye: null / 'orange' = the baked texture as is; otherwise a hex colour for the fur (uniform only, no recompile)
+  function setFurColor(hex) {
+    const off = !hex || hex === 'orange'; U.furOn.value = off ? 0 : 1; if (off) return;
+    U.furColor.value.set(hex); const c = U.furColor.value;   // linear; brighter dyes get less boost so white stays white-ish, dark ones still read
+    U.furGain.value = clamp(0.55 / Math.max(0.05, 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) ** 0.5, 1.15, 2.4);
+  }
   const armPoints = (s) => [`upperarm_${s}`, `forearm_${s}`, `hand_${s}`].map(wp);
   const shoulderPos = (s) => wp(`upperarm_${s}`);
-  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, isCyber, setCyber, armPoints, shoulderPos, state, GROW_TIME, armLen: len };
+  return { root, B, update, hideHead, fingers, resetPose, EYE, armOn, armGone, rip, regrow, isCyber, setCyber, armPoints, shoulderPos, setFurColor, state, GROW_TIME, armLen: len };
 }

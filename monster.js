@@ -1,11 +1,12 @@
-// The player-monster: a hairy demon-gorilla with a pale skull face, long fangs and huge clawed hands
-// (models/monster.glb, built from the user's reference sheet by monster_model/build_monster.py).
+// The player-monster and the Escape hunters: several different creature bodies on one shared rig (see Bodies below).
+// The original hairy demon-gorilla (models/monster.glb, monster_model/build_monster.py) is kept as 'demon' and fallback.
 // You become it with the red button: no legs, eyes at your headset, the body follows your facing,
 // two-bone IK arms reach your controllers, wrists turn with them, and 3-joint clawed fingers curl with
 // trigger (index) / grip (the rest) / thumb on a button. The jaw drops when you talk and the eyes burn red.
 // Interface used by game.js: { g, head (.visible hides it for first person), jaw, eyes, drips[], arms[{bl}], NECK,
 //                              updatePlayer(head, inputs, dt, t, talk), handPos(s),
-//                              setVariant('classic'|'hammer'|'chainsaw'), variant, weapons[], setAudio(fn) }
+//                              setVariant('classic'|'hammer'|'chainsaw'|'brute'|'stalker'|'crawler'|'demon'[, body]),
+//                              variant, weapon, body, weapons[], setAudio(fn), EYE, SC, B, armLength }
 // Variants: 'hammer' - its right hand is a bone sledge grown out of the arm; 'chainsaw' - a mechanical saw hides in the
 // right forearm: B/Y (buttons[5]) deploys it (the fingers split and peel back, the saw slides out through the hand) or
 // retracts it; hold the trigger to rev it while it is out.
@@ -15,43 +16,88 @@ import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 import { twoBoneIK } from './gorilla.js';
 import { makeBoneHammer, makeArmSaw } from './monster_weapons.js';
 
-const gltf = await new GLTFLoader().loadAsync('./models/monster.glb');
+// Bodies: each variant has its own model on the same rig (built by monster_model/build_variants.py):
+//   brute   (models/monster_brute.glb)   - hulking armoured knuckle-walker, tiny sunk head, tusks, ice-blue eyes
+//   stalker (models/monster_stalker.glb) - tall thin hunched thing, long neck/skull, 4 red eyes, ribs, very long fingers
+//   crawler (models/monster_crawler.glb) - low wide spined toad-thing, frog eyes, huge jaw, splayed arms, yellow eyes
+//   demon   (models/monster.glb)         - the original; also the fallback if a variant file fails to load
+// setVariant(weapon|body[, body]): 'classic' -> stalker, 'hammer' -> brute, 'chainsaw' -> crawler; or a body name
+// ('brute'|'stalker'|'crawler'|'demon') which picks that body with its own weapon.
+const BODY_FILES = { demon: './models/monster.glb', brute: './models/monster_brute.glb', stalker: './models/monster_stalker.glb', crawler: './models/monster_crawler.glb' };
+const BODY_FOR = { classic: 'stalker', hammer: 'brute', chainsaw: 'crawler' };
+const WEAPON_FOR = { stalker: 'classic', brute: 'hammer', crawler: 'chainsaw', demon: 'classic' };
+const _loader = new GLTFLoader();
+const GLTF = Object.fromEntries(await Promise.all(Object.entries(BODY_FILES).map(([k, url]) =>
+  _loader.loadAsync(url).then(g => [k, g], e => { console.warn('monster body failed to load:', url, e); return [k, null]; }))));
+if (!GLTF.demon) throw new Error('models/monster.glb missing');
 const FINGERS = ['index', 'middle', 'ring', 'pinky', 'thumb'];
 const V = () => new THREE.Vector3(), Q = () => new THREE.Quaternion();
 const X = new THREE.Vector3(1, 0, 0), Yax = new THREE.Vector3(0, 1, 0), Z = new THREE.Vector3(0, 0, 1);
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 function setWorldQuat(bone, qWorld) { const pq = Q(); bone.parent.getWorldQuaternion(pq); bone.quaternion.copy(pq.invert().multiply(qWorld)); bone.updateMatrixWorld(true); }
 
-export function makeMonster(scene) {
-  const g = new THREE.Group(); scene.add(g);
-  const model = SkeletonUtils.clone(gltf.scene); g.add(model);   // a fresh copy per monster, so several can exist (NPCs)
+// one body: a fresh skinned copy of a model plus everything measured from its bones (size, eye point, arm lengths,
+// elbow direction, palm offset, rest hand frame), so the IK and placement adapt to each creature's proportions.
+function buildBody(key) {
+  const src = GLTF[key] ? key : 'demon', native = src !== 'demon';
+  const model = SkeletonUtils.clone(GLTF[src].scene);   // a fresh copy per monster, so several can exist (NPCs)
   const B = {}, eyes = [], skinned = [];
   model.traverse(o => {
     if (o.isBone) B[o.name] = o;
     if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.frustumCulled = false; }
     if (o.isSkinnedMesh) skinned.push(o);
     if (o.isMesh && o.material && o.material.name === 'MonsterHand') { o.material = o.material.clone(); o.material.color.set('#5e4f4b'); }
-    if (o.isMesh && o.material && o.material.name === 'EyeGlow') { o.material = o.material.clone(); o.material.emissive.set('#ff1a0a'); eyes.push(o); }
+    if (o.isMesh && o.material && o.material.name === 'EyeGlow') { o.material = o.material.clone(); if (!native) o.material.emissive.set('#ff1a0a'); eyes.push(o); }
   });
   const rest = {}; for (const [n, b] of Object.entries(B)) rest[n] = b.quaternion.clone();
-  // size: its arms (upper + fore) match your reach in monster mode (rig 1.35x), like the old monster's 0.5 + 0.47 m
-  model.updateMatrixWorld(true);
+  model.updateMatrixWorld(true);   // measured on its own (no parent yet), so world = model space here
   const wp = (n) => B[n].getWorldPosition(V());
-  const SC = 0.97 / (wp('upperarm_L').distanceTo(wp('forearm_L')) + wp('forearm_L').distanceTo(wp('hand_L')));
+  const arm = wp('upperarm_L').distanceTo(wp('forearm_L')) + wp('forearm_L').distanceTo(wp('hand_L'));
+  // size: the original is scaled so its arms match your reach in monster mode (0.97 m); the variant models are built
+  // at their real size (their arm lengths, 0.94-1.25 m, are part of the design), so they keep scale 1
+  const SC = native ? 1 : 0.97 / arm;
   model.scale.setScalar(SC); model.updateMatrixWorld(true);
-  // its skull face juts far in front of its shoulders, so the point that sits at your headset is between the eyes and
-  // the shoulders (at eye height): the shoulders then sit just behind/below your head and the arms reach your hands.
+  // the face juts in front of the shoulders, so the point that sits at your headset is between the eyes and the
+  // shoulders (at eye height): the shoulders then sit just behind/below your head and the arms reach your hands.
   // In first person the head is hidden; in the mirror its face is a bit ahead of you, which reads fine for a monster.
   const eyeMid = wp('eye_L').add(wp('eye_R')).multiplyScalar(0.5), shMid = wp('upperarm_L').add(wp('upperarm_R')).multiplyScalar(0.5);
   const EYE = eyeMid.clone().lerp(shMid, 0.62); EYE.y = eyeMid.y;
-  const len = {}; for (const s of ['L', 'R']) len[s] = [wp(`upperarm_${s}`).distanceTo(wp(`forearm_${s}`)), wp(`forearm_${s}`).distanceTo(wp(`hand_${s}`))];
-  // rest hand frame: fingers along the hand bone's Y, palm normal = the finger bones' Z (pointing inward)
-  const handOffset = {};
+  const len = {}, pole = {}, handOffset = {};
   for (const s of ['L', 'R']) {
+    const S = wp(`upperarm_${s}`), E = wp(`forearm_${s}`), W = wp(`hand_${s}`);
+    len[s] = [S.distanceTo(E), E.distanceTo(W)];
+    // elbow direction (in body space, facing +Z): where the rest elbow sits off the shoulder-wrist line, blended with
+    // "out, down and back" (the original monster keeps its tuned constant)
+    const sx = s === 'L' ? 1 : -1, def = V().set(sx * 0.9, -0.5, -0.65);
+    const dir = W.clone().sub(S).normalize(), off = E.clone().sub(S); off.addScaledVector(dir, -off.dot(dir));
+    pole[s] = native && off.lengthSq() > 1e-6 ? off.normalize().add(def.clone().normalize()).normalize() : def;
+    // rest hand frame: fingers along the hand bone's Y, palm normal = the finger bones' Z (pointing inward)
     const hq = Q(); B[`hand_${s}`].getWorldQuaternion(hq); const fq = Q(); B[`middle1_${s}`].getWorldQuaternion(fq);
     const fy = Yax.clone().applyQuaternion(hq), pz = Z.clone().applyQuaternion(fq);
     const basis = new THREE.Matrix4().makeBasis(fy.clone().cross(pz).normalize(), fy, pz.clone().sub(fy.clone().multiplyScalar(pz.dot(fy))).normalize());
     handOffset[s] = Q().setFromRotationMatrix(basis).invert().multiply(hq);
+  }
+  // the palm centre sits on the controller: wrist -> 65% of the way to the middle knuckle (0.165 m on the original)
+  const PALM = native ? 0.65 * wp('hand_L').distanceTo(wp('middle1_L')) : 0.165;
+  return { key: src, model, B, eyes, skinned, rest, SC, EYE, len, pole, handOffset, PALM, arm: arm * SC };
+}
+
+export function makeMonster(scene, startBody = 'stalker') {
+  const g = new THREE.Group(); scene.add(g);
+  const bodies = {}; let body = null, out = null;
+  let B, rest, skinned, SC, EYE, len, pole0, handOffset, PALM;
+  const eyes = [];   // the same array object across body swaps (callers keep a reference to it)
+  const wp = (n) => B[n].getWorldPosition(V());
+  function useBody(key) {
+    key = GLTF[key] ? key : 'demon';
+    if (body && body.key === key) return;
+    if (body) { body.B.hand_R.scale.setScalar(1); g.remove(body.model); }
+    body = bodies[key] || (bodies[key] = buildBody(key));
+    ({ B, rest, skinned, SC, EYE, len, handOffset, PALM } = body); pole0 = body.pole;
+    g.add(body.model);
+    eyes.length = 0; eyes.push(...body.eyes);
+    applyHead();
+    if (out) Object.assign(out, { B, SC, EYE, jaw: B.jaw, body: body.key, armLength: body.arm });
   }
   const curl = {}; for (const s of ['L', 'R']) for (const f of FINGERS) curl[f + s] = 0.3;
 
@@ -66,15 +112,19 @@ export function makeMonster(scene) {
   let variant = 'classic', weapons = [], hammer = null, saw = null, audioFn = null, snd = null;
   const SAW = { target: 0, d: 0, rev: 0, lastBtn: false, sparkT: 0, wasReady: false };
   function stopSound() { if (snd) { try { snd.o.stop(); } catch (e) {} snd = null; } }
-  function setVariant(v) {
+  // v: a weapon ('classic'|'hammer'|'chainsaw') or a body ('brute'|'stalker'|'crawler'|'demon'); bodyKey overrides the body
+  function setVariant(v, bodyKey) {
     if (hammer) { hammer.dispose(); hammer = null; } if (saw) { saw.dispose(); saw = null; } stopSound();
-    B.hand_R.scale.setScalar(1); variant = v; weapons = [];
+    if (B) B.hand_R.scale.setScalar(1); variant = v; weapons = [];
+    const name = v;
+    if (WEAPON_FOR[v]) { bodyKey = bodyKey || v; v = WEAPON_FOR[v]; }
+    useBody(bodyKey || BODY_FOR[v] || 'demon');
     const tipVel = V(), prev = V();
     if (v === 'hammer') { hammer = makeBoneHammer(scene); g.add(hammer.root);
       weapons.push({ type: 'hammer', side: 'R', ready: true, rev: 0, cutPoints: () => [], headPoint: hammer.headPoint, tipVel, _prev: prev, spark: (at, n) => hammer.sparks.emit(at, n) }); }
     if (v === 'chainsaw') { saw = makeArmSaw(scene); g.add(saw.root); Object.assign(SAW, { target: 0, d: 0, rev: 0, lastBtn: false, wasReady: false });
       weapons.push({ type: 'chainsaw', side: 'R', ready: false, rev: 0, cutPoints: () => saw.cutPoints(), headPoint: saw.tipPoint, tipVel, _prev: prev, spark: (at, n) => saw.sparks.emit(at, n) }); }
-    out.variant = v; out.weapons = weapons;
+    variant = v; out.variant = name; out.weapon = v; out.weapons = weapons;   // out.variant = the name asked for (game.js compares it)
   }
   function sawSound(on, rev) {
     if (!audioFn) return; if (!snd) { const a = audioFn(); if (!a) return; const o = a.createOscillator(); o.type = 'sawtooth'; const f = a.createBiquadFilter(); f.type = 'lowpass'; const gn = a.createGain(); gn.gain.value = 0; o.connect(f); f.connect(gn); gn.connect(a.destination); o.start(); snd = { a, o, f, g: gn }; }
@@ -103,8 +153,8 @@ export function makeMonster(scene) {
       const sx = s === 'L' ? 1 : -1;
       const fingerDir = V().set(0, 0, -1).applyQuaternion(inp.quat);
       const palm = V().set(sx, 0, 0).applyQuaternion(inp.quat);               // grip space: palm normal +X (left) / -X (right)
-      const wrist = inp.pos.clone().addScaledVector(fingerDir, -0.165);       // palm centre on the controller (the hands are big)
-      const pole = V().set(sx * 0.9, -0.5, -0.65).applyAxisAngle(Yax, yaw);     // elbows out, down and back
+      const wrist = inp.pos.clone().addScaledVector(fingerDir, -PALM);        // palm centre on the controller (measured per body)
+      const pole = pole0[s].clone().applyAxisAngle(Yax, yaw);                   // elbows out, down and back (measured per body)
       twoBoneIK(B[`upperarm_${s}`], B[`forearm_${s}`], B[`hand_${s}`], wrist, pole, len[s][0], len[s][1]);
       const pz = palm.sub(fingerDir.clone().multiplyScalar(palm.dot(fingerDir))).normalize();
       const basis = new THREE.Matrix4().makeBasis(fingerDir.clone().cross(pz).normalize(), fingerDir, pz);
@@ -160,10 +210,12 @@ export function makeMonster(scene) {
   let headShown = true;
   const head = {
     get visible() { return headShown; },
-    set visible(v) { if (v === headShown) return; headShown = v; B.head.scale.setScalar(v ? 1 : 0.001); eyes.forEach(e => { e.visible = v; }); B.head.updateMatrixWorld(true); skinned.forEach(m => m.skeleton.update()); },
+    set visible(v) { if (v === headShown) return; headShown = v; applyHead(); },
   };
+  function applyHead() { if (!B) return; B.head.scale.setScalar(headShown ? 1 : 0.001); eyes.forEach(e => { e.visible = headShown; }); B.head.updateMatrixWorld(true); skinned.forEach(m => m.skeleton.update()); }
   const arms = [{ bl: { visible: false } }, { bl: { visible: false } }];
-  const out = { g, head, jaw: B.jaw, eyes, drips: [], arms, NECK: 0, B, SC, EYE, updatePlayer, handPos, setVariant, variant, weapons, setAudio: (fn) => { audioFn = fn; },
-    get sawState() { return { ...SAW }; } };
+  out = { g, head, eyes, drips: [], arms, NECK: 0, updatePlayer, handPos, setVariant, variant, weapons, setAudio: (fn) => { audioFn = fn; },
+    get sawState() { return { ...SAW }; }, bodies: Object.keys(BODY_FILES).filter(k => GLTF[k]) };
+  setVariant(WEAPON_FOR[startBody] ? startBody : 'classic');   // picks the body (sets out.B / SC / EYE / jaw / body)
   return out;
 }

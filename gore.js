@@ -2,7 +2,7 @@
 //  - torn ends get a raw wound cap, bone ends stick out of arms and shoulders, a head comes off with its spine
 //  - "full" gore adds guts, meat chunks and (for big hits) the body split down the middle with a cut face
 //  - blood: stretched droplets (one instanced mesh), rhythmic spurts from wounds, growing wet splats and pools
-//  - simple physics: pieces bounce off the world and each other; synthesized tearing / squelch / thud sounds
+//  - simple physics: pieces bounce off the world and each other; sample-bank sounds (sfx/*.mp3) with synthesized fallback
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { sliceObject } from './slicer.js';
@@ -172,17 +172,47 @@ export async function initGore(scene, addSplat, contact = null) {
     R.tip.visible = visible >= NV; R.tip.position.copy(R.p[NV]);
   }
 
-  // ---------- sound (synthesized, no files) ----------
+  // ---------- sound: recorded sample bank (sfx/*.mp3, made with a sound-generation tool) + synthesized fallback ----------
   let ac = null, noiseBuf = null;
-  const audio = () => { if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); const n = ac.sampleRate; noiseBuf = ac.createBuffer(1, n, n); const d = noiseBuf.getChannelData(0); for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1; } catch (e) { ac = null; } } if (ac && ac.state === 'suspended') ac.resume(); return ac; };
+  // the sample bank loads lazily on the first audio() unlock; until a type's buffers arrive (or if a file fails / offline) the synth version plays
+  const BANK = { slap_floor: 2, slap_metal: 2, slap_soft: 2, slap_glass: 2, land: 2, tear: 2, crunch: 1, squelch: 1, dye: 1, record: 1, pick: 1,
+    ape_hoot: 2, ape_chestbeat: 1, roar_brute: 1, roar_stalker: 1, roar_crawler: 1 };
+  const BASE = { slap_floor: 0.45, slap_metal: 0.35, slap_soft: 0.45, slap_glass: 0.35, land: 0.75, tear: 0.6, crunch: 0.6, squelch: 0.5, dye: 0.5, record: 0.45, pick: 0.4,
+    ape_hoot: 0.6, ape_chestbeat: 0.7, roar_brute: 0.8, roar_stalker: 0.7, roar_crawler: 0.8 };   // per-type mix level (files are already loudness-matched)
+  const bank = {}, loadedFiles = []; let bankStarted = false;
+  const loadBank = (a) => { if (bankStarted) return; bankStarted = true;
+    for (const type in BANK) for (let i = 1; i <= BANK[type]; i++) { const name = BANK[type] > 1 ? `${type}_${i}` : type;
+      fetch(new URL(`./sfx/${name}.mp3`, import.meta.url)).then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status))
+        .then(b => new Promise((res, rej) => a.decodeAudioData(b, res, rej))).then(buf => { (bank[type] ||= []).push(buf); loadedFiles.push(name); }).catch(() => {}); } };
+  const sfxLoaded = () => loadedFiles.slice().sort();
+  const audio = () => { if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); const n = ac.sampleRate; noiseBuf = ac.createBuffer(1, n, n); const d = noiseBuf.getChannelData(0); for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1; } catch (e) { ac = null; } } if (ac && ac.state === 'suspended') ac.resume(); if (ac) loadBank(ac); return ac; };
+  // optional positional audio: setEar(camera) once, then sfx(type, k, worldPos) pans/attenuates from that point
+  let ear = null; const _ep = V(), _ef = V(), _eu = V(), _eq = new THREE.Quaternion(), _es = V();
+  const setEar = (obj) => { ear = obj; };
+  const placeEar = (a) => { ear.updateMatrixWorld(); ear.matrixWorld.decompose(_ep, _eq, _es); _ef.set(0, 0, -1).applyQuaternion(_eq); _eu.set(0, 1, 0).applyQuaternion(_eq); const L = a.listener;
+    if (L.positionX) { L.positionX.value = _ep.x; L.positionY.value = _ep.y; L.positionZ.value = _ep.z; L.forwardX.value = _ef.x; L.forwardY.value = _ef.y; L.forwardZ.value = _ef.z; L.upX.value = _eu.x; L.upY.value = _eu.y; L.upZ.value = _eu.z; }
+    else { L.setPosition(_ep.x, _ep.y, _ep.z); L.setOrientation(_ef.x, _ef.y, _ef.z, _eu.x, _eu.y, _eu.z); } };
   // all gore sounds go through one limiter (no clipping/crackle), each type can't repeat too fast, and only a few play at once
-  let master = null; const lastAt = {}; let voices = 0;
-  const GAP = { tear: 0.22, crunch: 0.25, squelch: 0.1, thud: 0.1 };
-  function sfx(type, k = 1) {
-    const a = audio(); if (!a) return; const t = a.currentTime;
-    if (t - (lastAt[type] ?? -9) < (GAP[type] ?? 0.1) || voices >= 6) return; lastAt[type] = t; voices++; setTimeout(() => { voices--; }, 600);
+  let master = null; const lastAt = {}; let voices = 0, slapVoices = 0;
+  const GAP = { tear: 0.22, crunch: 0.25, squelch: 0.1, thud: 0.1, slap_floor: 0.06, slap_metal: 0.06, slap_soft: 0.06, slap_glass: 0.06, land: 0.15, dye: 0.12, record: 0.6, pick: 0.07,
+    ape_hoot: 0.5, ape_chestbeat: 1.0, roar_brute: 1.2, roar_stalker: 1.0, roar_crawler: 1.0 };
+  // slaps (players pat surfaces ~4x/s while moving) get their OWN 2-voice budget so they never starve the gore voices
+  const SLAP = { slap_floor: 1, slap_metal: 1, slap_soft: 1, slap_glass: 1 };
+  const slapEnd = () => { slapVoices--; }, voiceEnd = () => { voices--; };
+  function sfx(type, k = 1, pos = null) {
+    const a = audio(); if (!a) return; const t = a.currentTime; const isSlap = SLAP[type] === 1; const bufs = bank[type];
+    if (!bufs && (type.startsWith('ape_') || type.startsWith('roar_'))) return;   // sample-only types (no synth version): silent until loaded
+    if (t - (lastAt[type] ?? -9) < (GAP[type] ?? 0.1) || (isSlap ? slapVoices >= 2 : voices >= 6)) return; lastAt[type] = t;
+    const buf = bufs ? bufs[(Math.random() * bufs.length) | 0] : null;
+    const hold = buf ? Math.min(isSlap ? 0.3 : 1.5, Math.max(0.3, buf.duration)) * 1000 : (isSlap ? 300 : 600);
+    if (isSlap) { slapVoices++; setTimeout(slapEnd, hold); } else { voices++; setTimeout(voiceEnd, hold); }
+    k = Math.min(1.5, Math.max(0.02, k)); const v = 0.93 + Math.random() * 0.14, br = (0.75 + 0.4 * Math.min(1, k)) * v; // per-hit pitch jitter, k = loudness + brightness
     if (!master) { const comp = a.createDynamicsCompressor(); comp.threshold.value = -18; comp.ratio.value = 8; comp.attack.value = 0.003; comp.release.value = 0.15; master = a.createGain(); master.gain.value = 0.8; master.connect(comp); comp.connect(a.destination); }
     const out = a.createGain(); out.connect(master);
+    if (pos && ear && a.createPanner) { const p = a.createPanner(); p.panningModel = 'equalpower'; p.distanceModel = 'inverse'; p.refDistance = 1.5; p.maxDistance = 40; p.rolloffFactor = 1;
+      if (p.positionX) { p.positionX.value = pos.x; p.positionY.value = pos.y; p.positionZ.value = pos.z; } else p.setPosition(pos.x, pos.y, pos.z);
+      placeEar(a); out.disconnect(); out.connect(p); p.connect(master); }
+    if (buf) { const s = a.createBufferSource(); s.buffer = buf; s.playbackRate.value = 0.94 + Math.random() * 0.12; out.gain.value = (BASE[type] ?? 0.5) * k; s.connect(out); s.start(t); return; }
     const noise = (dur, f0, f1, q, gain, t0 = 0) => { const s = a.createBufferSource(); s.buffer = noiseBuf; s.playbackRate.value = 0.6 + Math.random() * 0.5; const f = a.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = q; f.frequency.setValueAtTime(f0, t + t0); f.frequency.exponentialRampToValueAtTime(f1, t + t0 + dur);
       const g = a.createGain(); g.gain.setValueAtTime(0.0001, t + t0); g.gain.exponentialRampToValueAtTime(gain, t + t0 + 0.015); g.gain.exponentialRampToValueAtTime(0.0001, t + t0 + dur); s.connect(f); f.connect(g); g.connect(out); s.start(t + t0, Math.random() * 0.5, dur + 0.05); };
     const tone = (dur, f0, f1, gain, t0 = 0) => { const o = a.createOscillator(); o.frequency.setValueAtTime(f0, t + t0); o.frequency.exponentialRampToValueAtTime(f1, t + t0 + dur); const g = a.createGain(); g.gain.setValueAtTime(gain, t + t0); g.gain.exponentialRampToValueAtTime(0.0001, t + t0 + dur); o.connect(g); g.connect(out); o.start(t + t0); o.stop(t + t0 + dur + 0.02); };
@@ -190,6 +220,16 @@ export async function initGore(scene, addSplat, contact = null) {
     else if (type === 'crunch') { for (let i = 0; i < 6; i++) noise(0.05, 3000, 1200, 3, 0.3 * k, i * 0.035); tone(0.2, 110, 45, 0.45 * k); }
     else if (type === 'squelch') noise(0.12, 700, 250, 3, 0.25 * k);
     else if (type === 'thud') { tone(0.18, 95, 40, 0.5 * k); noise(0.08, 400, 150, 1, 0.2 * k); }
+    // --- surface slaps (kept quieter than tear/crunch) ---
+    else if (type === 'slap_floor') { noise(0.07, 900 * br, 250, 1.2, 0.26 * k); tone(0.08, 150 * v, 70 * v, 0.2 * k); }
+    else if (type === 'slap_metal') { noise(0.03, 4200 * br, 2500, 2, 0.16 * k); tone(0.06, 180 * v, 90 * v, 0.14 * k); tone(0.25, 610 * v, 598 * v, 0.08 * k); tone(0.2, 1490 * v, 1470 * v, 0.05 * k); tone(0.14, 2230 * v, 2200 * v, 0.03 * k); }
+    else if (type === 'slap_soft') { noise(0.09, 450 * br, 160, 0.9, 0.24 * k); tone(0.1, 110 * v, 55 * v, 0.2 * k); }
+    else if (type === 'slap_glass') { noise(0.025, 6000 * br, 4000, 3, 0.09 * k); tone(0.12, 2900 * v, 2860 * v, 0.07 * k); tone(0.09, 4700 * v, 4640 * v, 0.04 * k); }
+    // --- body / world / UI ---
+    else if (type === 'land') { tone(0.32, 80 * v, 35, 0.6 * k); tone(0.18, 140 * v, 60, 0.25 * k); noise(0.25, 1100 * br, 200, 0.8, 0.3 * k); noise(0.12, 300, 120, 1, 0.28 * k, 0.02); }
+    else if (type === 'dye') { tone(0.11, 260 * v, 720 * v, 0.22 * k); noise(0.08, 600 * br, 300, 2, 0.06 * k); for (let i = 0; i < 3; i++) { const f = (500 + Math.random() * 500) * v; tone(0.04, f, f * 1.6, 0.08 * k, 0.1 + i * 0.05 + Math.random() * 0.02); } }
+    else if (type === 'record') { tone(0.35, 880, 878, 0.18 * k); tone(0.5, 1318.5, 1316, 0.18 * k, 0.12); tone(0.3, 2637, 2630, 0.05 * k, 0.12); }
+    else if (type === 'pick') { tone(0.04, 1400 * v, 700 * v, 0.12 * k); noise(0.03, 3000 * br, 2000, 2, 0.05 * k); }
   }
 
   // ---------- blood droplets: one instanced mesh, stretched along their velocity ----------
@@ -386,5 +426,5 @@ export async function initGore(scene, addSplat, contact = null) {
       }
     }
   }
-  return { G, makeAvatar, makeLimb, dismember, tearOff, update, spurt, sfx, audio, jointInfo, cutLoose, cutAvatar, breakApart, pieces };
+  return { G, makeAvatar, makeLimb, dismember, tearOff, update, spurt, sfx, sfxLoaded, setEar, audio, jointInfo, cutLoose, cutAvatar, breakApart, pieces };
 }
